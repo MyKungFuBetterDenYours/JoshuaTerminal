@@ -698,6 +698,13 @@ class ChartPane {
           const newBar = { time: newBarTime, open: price, high: price, low: price, close: price };
           this.candles.push(newBar);
           try { this.candleSeries.update(newBar); } catch(e) {}
+          // ── CRITICAL: Re-anchor so next tick measures elapsed time from this
+          // new bar's start, not from the original candle-load time.
+          // Without this, barsElapsed stays >= 1 on every subsequent tick,
+          // newBarTime equals last.time (already pushed), newBarTime > last.time
+          // is false, and the bar never updates — or worse, a duplicate is pushed.
+          this._candlesLoadedAt   = Date.now() - ((elapsedSec % barDurSec) * 1000);
+          this._lastBarTimeAtLoad = newBarTime;
         } else {
           // barsElapsed advanced but newBarTime isn't newer — just update last
           const updated = { ...last, close: price,
