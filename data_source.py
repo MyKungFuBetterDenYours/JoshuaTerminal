@@ -62,6 +62,41 @@ MT5_BRIDGE_HOST = os.environ.get("MT5_BRIDGE_HOST", "localhost")
 MT5_BRIDGE_PORT = int(os.environ.get("MT5_BRIDGE_PORT", 5006))
 _MT5_BASE       = f"http://{MT5_BRIDGE_HOST}:{MT5_BRIDGE_PORT}"
 
+# ── MT5 broker timezone offset ────────────────────────────────────────────────
+# MT5's copy_rates_from_pos() returns timestamps in broker server time, not UTC.
+# We fetch the offset once from the bridge /timezone endpoint and apply it when
+# normalising candle timestamps to true UTC unix seconds.
+# _mt5_tz_offset is in seconds; positive means broker is ahead of UTC (e.g. +10800 = UTC+3).
+_mt5_tz_offset: int = 0
+_mt5_tz_fetched: bool = False
+
+def _fetch_mt5_tz_offset() -> int:
+    """
+    Query the bridge /timezone endpoint to determine the broker's UTC offset.
+    Result is cached for the lifetime of the process — the offset only changes
+    during DST transitions which are rare and require a restart anyway.
+    Returns offset in seconds (broker_time - utc = offset).
+    """
+    global _mt5_tz_offset, _mt5_tz_fetched
+    if _mt5_tz_fetched:
+        return _mt5_tz_offset
+    try:
+        import requests as _r
+        resp = _r.get(f"{_MT5_BASE}/timezone", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("ok"):
+                _mt5_tz_offset  = int(data.get("offset_seconds", 0))
+                _mt5_tz_fetched = True
+                logger.info(f"MT5 broker UTC offset: {_mt5_tz_offset}s "
+                            f"({_mt5_tz_offset/3600:+.1f}h) via {data.get('source','?')}")
+                return _mt5_tz_offset
+    except Exception as e:
+        logger.warning(f"MT5 /timezone fetch failed: {e} — assuming UTC (offset=0)")
+    _mt5_tz_fetched = True   # don't retry on every candle request
+    _mt5_tz_offset  = 0
+    return 0
+
 # ── Active source selection ───────────────────────────────────────────────────
 # Priority: mt5 (if enabled) → oanda (if key present) → yfinance (fallback)
 if MT5_ENABLED:
@@ -426,11 +461,15 @@ def mt5_get_candles(symbol: str, interval: str = "15m", limit: int = 300) -> lis
         if r.status_code == 200:
             data = r.json()
             if data.get("ok") and data.get("candles"):
+                # Fetch the broker's UTC offset once (cached after first call).
+                # MT5 copy_rates_from_pos() returns timestamps in broker server
+                # time — subtract the offset to get true UTC unix seconds.
+                tz_offset = _fetch_mt5_tz_offset()
                 candles = []
                 for c in data["candles"]:
                     try:
                         candles.append({
-                            "time":   int(c["time"]),
+                            "time":   int(c["time"]) - tz_offset,  # → true UTC
                             "open":   round(float(c["open"]),  6),
                             "high":   round(float(c["high"]),  6),
                             "low":    round(float(c["low"]),   6),
@@ -462,6 +501,17 @@ def mt5_is_connected() -> bool:
         return r.status_code == 200 and r.json().get("ok", False)
     except Exception:
         return False
+
+
+def mt5_reset_tz_cache() -> int:
+    """
+    Force a fresh /timezone probe on the next mt5_get_candles() call.
+    Call this after DST transitions or bridge restarts.
+    Returns the newly fetched offset in seconds.
+    """
+    global _mt5_tz_fetched
+    _mt5_tz_fetched = False
+    return _fetch_mt5_tz_offset()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

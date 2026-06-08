@@ -474,6 +474,19 @@ def api_mt5_status():
     return jsonify({"ok": connected})
 
 
+@app.route("/api/mt5/timezone")
+def api_mt5_timezone():
+    """Return the cached MT5 broker UTC offset. Useful for debugging timestamp issues."""
+    if not ds.MT5_ENABLED:
+        return jsonify({"ok": False, "reason": "MT5 not enabled"})
+    offset = ds._fetch_mt5_tz_offset()
+    return jsonify({
+        "ok":             True,
+        "offset_seconds": offset,
+        "offset_hours":   round(offset / 3600, 2),
+    })
+
+
 @app.route("/api/alert", methods=["POST"])
 def api_alert():
     payload   = request.get_json(silent=True) or {}
