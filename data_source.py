@@ -426,7 +426,21 @@ def mt5_get_candles(symbol: str, interval: str = "15m", limit: int = 300) -> lis
         if r.status_code == 200:
             data = r.json()
             if data.get("ok") and data.get("candles"):
-                return data["candles"]
+                candles = []
+                for c in data["candles"]:
+                    try:
+                        candles.append({
+                            "time":   int(c["time"]),
+                            "open":   round(float(c["open"]),  6),
+                            "high":   round(float(c["high"]),  6),
+                            "low":    round(float(c["low"]),   6),
+                            "close":  round(float(c["close"]), 6),
+                            "volume": int(c.get("volume", 0)),
+                        })
+                    except (KeyError, TypeError, ValueError) as e:
+                        logger.debug(f"MT5 candle skipped (bad format): {c} — {e}")
+                if candles:
+                    return sorted(candles, key=lambda x: x["time"])
         logger.warning(f"MT5 bridge /candles returned {r.status_code} for {sym} {interval} — falling back")
     except Exception as e:
         logger.warning(f"MT5 bridge unreachable for candles ({sym} {interval}): {e} — falling back")

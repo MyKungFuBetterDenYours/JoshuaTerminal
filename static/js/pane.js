@@ -75,9 +75,8 @@ class ChartPane {
     this.currentPrice     = null;
     this._ro              = null;
 
-    // ── Bar advance tracking (timezone-safe) ─────────────
-    this._candlesLoadedAt   = null;  // Date.now() when candles were last rendered
-    this._lastBarTimeAtLoad = 0;     // last candle's .time when loaded (broker-time domain)
+    // ── Bar advance / reload state ───────────────────────
+    this._barReloadPending  = false;  // guard against concurrent candle reloads
 
     // ── Drawing tools state ──────────────────────────────
     this.drawingMode      = null;   // 'fib' | null
@@ -543,11 +542,7 @@ class ChartPane {
     }
 
     if (last) this._updateTicker(last.close, last.close, 0, 0, 'up');
-    // Record wall-clock anchor for MT5 elapsed-time bar-advance (broker timestamps
-    // are not UTC so we can't compare last.time against Date.now()/1000 directly).
-    this._candlesLoadedAt   = Date.now();
-    this._lastBarTimeAtLoad = last ? last.time : 0;
-    this._barReloadPending  = false;
+    this._barReloadPending = false;
     this._startCandleCountdown();
     this._startPeriodicReload();
   }
@@ -684,31 +679,14 @@ class ChartPane {
       const last       = this.candles[this.candles.length - 1];
 
       // ── Bar advance ──────────────────────────────────────────────────────────
-      // Strategy depends on data source time domain:
-      //
-      //   OANDA / yfinance: timestamps are true UTC unix seconds — compare
-      //     last.time + barDurSec directly against Date.now()/1000.
-      //
-      //   MT5: timestamps are broker server time (UTC+2/+3). Direct comparison
-      //     against Date.now()/1000 gives a 2-3h false offset so the bar never
-      //     advances. Use elapsed wall-clock time since _candlesLoadedAt instead.
-      //
-      // On new-bar detection: reload candles from the server (real OHLC, handles
-      // any gap including weekends/overnight). Guard with _barReloadPending flag.
-      // While reload is in flight, update the current bar's close optimistically.
+      // All sources (OANDA, MT5, yfinance, Hyperliquid) return genuine UTC unix
+      // timestamps. Compare last.time + barDurSec against Date.now()/1000 directly.
+      // On new-bar detection: reload candles from the server (real OHLC from the
+      // broker, handles weekends/overnight gaps correctly).
+      // Guard with _barReloadPending to prevent stacked concurrent reloads.
 
-      let newBarDetected = false;
-
-      if (this.source === 'mt5' && this._candlesLoadedAt) {
-        // MT5 path — elapsed wall-clock time (timezone-agnostic)
-        const elapsedSec  = (Date.now() - this._candlesLoadedAt) / 1000;
-        const barsElapsed = barDurSec > 0 ? Math.floor(elapsedSec / barDurSec) : 0;
-        if (barsElapsed > 0) newBarDetected = true;
-      } else if (barDurSec > 0) {
-        // OANDA / yfinance / hyperliquid — direct UTC comparison
-        const nowSec = Date.now() / 1000;
-        if (nowSec >= last.time + barDurSec) newBarDetected = true;
-      }
+      const nowSec = Date.now() / 1000;
+      const newBarDetected = barDurSec > 0 && nowSec >= last.time + barDurSec;
 
       if (newBarDetected && !this._barReloadPending) {
         this._barReloadPending = true;
@@ -748,25 +726,14 @@ class ChartPane {
       const intervalMs = this._intervalToMs(this.interval);
       if (!intervalMs || !this.candles.length) { el.textContent = ''; return; }
 
-      const barDurSec = intervalMs / 1000;
-      let remSec;
-
-      if (this.source === 'mt5' && this._candlesLoadedAt) {
-        // MT5: broker timestamps are not UTC — use elapsed wall-clock time since
-        // the last bar was loaded/created, same approach as bar-advance detection.
-        const elapsedSec = (Date.now() - this._candlesLoadedAt) / 1000;
-        const secIntoBar = elapsedSec % barDurSec;
-        remSec = Math.max(0, barDurSec - secIntoBar);
-      } else {
-        // OANDA / yfinance / hyperliquid: candle timestamps are true UTC seconds.
-        // Use the last candle's open time to anchor exactly where we are in the
-        // bar cycle — stays correct after page reload, interval switches, and
-        // long sessions regardless of when _candlesLoadedAt was set.
-        const last      = this.candles[this.candles.length - 1];
-        const nowSec    = Date.now() / 1000;
-        const secIntoBar = (nowSec - last.time) % barDurSec;
-        remSec = Math.max(0, barDurSec - secIntoBar);
-      }
+      // All sources return genuine UTC unix timestamps, so anchor the countdown
+      // to the last candle's open time. This stays correct after reloads,
+      // interval switches, and long sessions — no elapsed-time approximation needed.
+      const barDurSec  = intervalMs / 1000;
+      const last       = this.candles[this.candles.length - 1];
+      const nowSec     = Date.now() / 1000;
+      const secIntoBar = (nowSec - last.time) % barDurSec;
+      const remSec     = Math.max(0, barDurSec - secIntoBar);
 
       el.textContent = '⏱ ' + this._formatCountdown(remSec, intervalMs);
 
@@ -786,8 +753,8 @@ class ChartPane {
   }
 
   // ── Periodic candle reload ────────────────────────────────────────────────────
-  // Fires a full _loadData() at each real bar boundary so the chart always
-  // catches up after weekends, overnight gaps, or long open sessions.
+  // Fires _loadData() at each real bar boundary so the chart always catches up
+  // after weekends, overnight gaps, or long open sessions.
   _startPeriodicReload() {
     this._stopPeriodicReload();
     const intervalMs = this._intervalToMs(this.interval);
@@ -795,10 +762,9 @@ class ChartPane {
     const barDurMs = Math.max(intervalMs, 60000);
 
     const scheduleNext = () => {
-      // Calculate ms until the next bar boundary using real UTC time
-      // (falls back to barDurMs for MT5 where we can't compute a real boundary)
+      // All sources return UTC timestamps — compute exact ms until next boundary.
       let msUntilNext = barDurMs;
-      if (this.source !== 'mt5' && this.candles.length) {
+      if (this.candles.length) {
         const last       = this.candles[this.candles.length - 1];
         const nowSec     = Date.now() / 1000;
         const secIntoBar = (nowSec - last.time) % (barDurMs / 1000);
@@ -809,10 +775,10 @@ class ChartPane {
           this._barReloadPending = true;
           this._loadData(true).finally(() => {
             this._barReloadPending = false;
-            scheduleNext(); // reschedule after each reload
+            scheduleNext();
           });
         } else {
-          scheduleNext(); // already reloading, just reschedule
+          scheduleNext();
         }
       }, msUntilNext);
     };
@@ -3940,10 +3906,8 @@ class ChartPane {
   setSource(src) {
     if (this.source === src) return;   // no-op if unchanged
     this._unsubscribeYF();
-    // Reset bar-advance state so the new source's time domain is used cleanly
-    this._barReloadPending  = false;
-    this._candlesLoadedAt   = null;
-    this._lastBarTimeAtLoad = 0;
+    // Reset reload state so the new source starts clean
+    this._barReloadPending = false;
     this._stopPeriodicReload();
     this.source = src;
     this._loadData();

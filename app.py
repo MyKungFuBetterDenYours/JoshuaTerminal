@@ -509,31 +509,41 @@ def api_alert():
 
 # ─── SocketIO ────────────────────────────────────────────────────────────────
 
+def _norm_sym(s: str) -> str:
+    """Normalise symbol to bare uppercase format — strips /, -, _, =X."""
+    return s.upper().replace("/","").replace("-","").replace("_","").replace("=X","")
+
 @socketio.on("subscribe_yf")
 def on_sub_yf(data):
-    sym    = data.get("symbol", "").upper()
-    source = data.get("source", ds.ACTIVE_FOREX_SOURCE)  # pane's chosen source
-    if not sym: return
+    raw    = data.get("symbol", "")
+    source = data.get("source", ds.ACTIVE_FOREX_SOURCE)
+    if not raw: return
+    # MT5 uses bare symbols (EURUSD); OANDA/YF accept slash format but
+    # normalise MT5 key so mt5_subs dict and emitted symbol always match.
+    sym_mt5  = _norm_sym(raw)   # EURUSD — for mt5_subs key and emit
+    sym_raw  = raw.upper()      # EUR/USD — for OANDA/YF which handle formatting
     if source == "oanda":
-        oanda_stream.subscribe(sym)
+        oanda_stream.subscribe(sym_raw)
     elif source == "mt5":
         with mt5_lock:
-            mt5_subs.setdefault(sym, 0)
+            mt5_subs.setdefault(sym_mt5, 0)
     else:
         with yf_lock:
-            yf_subs.setdefault(sym, 0)
-    logger.info(f"Subscribed [{source}]: {sym}")
+            yf_subs.setdefault(sym_raw, 0)
+    logger.info(f"Subscribed [{source}]: {sym_mt5 if source == 'mt5' else sym_raw}")
 
 @socketio.on("unsubscribe_yf")
 def on_unsub_yf(data):
-    sym    = data.get("symbol", "").upper()
+    raw    = data.get("symbol", "")
     source = data.get("source", ds.ACTIVE_FOREX_SOURCE)
+    sym_mt5 = _norm_sym(raw)
+    sym_raw = raw.upper()
     if source == "oanda":
-        oanda_stream.unsubscribe(sym)
+        oanda_stream.unsubscribe(sym_raw)
     elif source == "mt5":
-        with mt5_lock: mt5_subs.pop(sym, None)
+        with mt5_lock: mt5_subs.pop(sym_mt5, None)
     else:
-        with yf_lock: yf_subs.pop(sym, None)
+        with yf_lock: yf_subs.pop(sym_raw, None)
 
 @socketio.on("connect")
 def on_connect(): logger.info(f"Browser: {request.sid}")
