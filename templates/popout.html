@@ -241,6 +241,19 @@
     if (cfg.has_oanda_key) setDot('pop-dot-oanda', 'live');
   }).catch(() => {});
 
+  // ── Follow main window source changes ──────────────────────────────────────
+  // The main window writes 'globalSource' to localStorage when the SOURCE
+  // dropdown changes. The storage event fires in all other same-origin windows
+  // so the popout can react immediately without polling.
+  window.addEventListener('storage', e => {
+    if (e.key !== 'globalSource' || !e.newValue || !pane) return;
+    const newSrc = e.newValue;
+    // Only switch if not a crypto pane — crypto always stays on hyperliquid
+    if (pane.source !== 'hyperliquid') {
+      pane.setSource(newSrc);
+    }
+  });
+
   // ── Live price routing → pane.onPriceUpdate() ──────────────────────────────
   // (mirrors app.js socket handlers — popout doesn't load app.js)
   const _norm = s => s.replace(/[\/_-]/g, '').toUpperCase();

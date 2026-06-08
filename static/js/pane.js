@@ -449,7 +449,7 @@ class ChartPane {
 
   // ── Data loading ────────────────────────────────────
 
-  async _loadData() {
+  async _loadData(silentReload = false) {
     if (!this.chart) {
       // Chart not ready yet, retry shortly
       setTimeout(() => this._loadData(), 100);
@@ -458,10 +458,10 @@ class ChartPane {
     // Clear candles immediately so onPriceUpdate() does not mutate stale bars
     // during the async fetch (source/interval switch race condition).
     this.candles = [];
-    this._showLoading(true);
+    if (!silentReload) this._showLoading(true);
     try {
       const url = `/api/candles?symbol=${encodeURIComponent(this.symbol)}&interval=${encodeURIComponent(this.interval)}&source=${this.source}&limit=400`;
-      console.log(`[Pane ${this.id}] → ${url}`);
+      console.log(`[Pane ${this.id}] → ${url}${silentReload ? ' (silent reload)' : ''}`);
 
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -470,22 +470,25 @@ class ChartPane {
       console.log(`[Pane ${this.id}] ← ${data.count} candles for ${data.symbol} (${data.source})`);
 
       if (!data.candles || data.candles.length === 0) {
-        this._showError(`No data returned for "${this.symbol}" — try a different symbol or interval`);
+        if (!silentReload)
+          this._showError(`No data returned for "${this.symbol}" — try a different symbol or interval`);
         return;
       }
 
       this.candles = this._dedup(data.candles);
       this._renderCandles();
       this._renderActiveIndicators();
-      this._subscribeYF();
-      // Restore saved state (drawings shared across intervals, indicators per-interval)
-      this._restoreState();
+      if (!silentReload) {
+        this._subscribeYF();
+        // Restore saved state (drawings shared across intervals, indicators per-interval)
+        this._restoreState();
+      }
 
     } catch(e) {
       console.error(`[Pane ${this.id}] fetch error:`, e);
-      this._showError(`Fetch failed: ${e.message}`);
+      if (!silentReload) this._showError(`Fetch failed: ${e.message}`);
     } finally {
-      this._showLoading(false);
+      if (!silentReload) this._showLoading(false);
     }
   }
 
@@ -540,12 +543,13 @@ class ChartPane {
     }
 
     if (last) this._updateTicker(last.close, last.close, 0, 0, 'up');
-    // Record real wall-clock time when this set of candles was loaded.
-    // onPriceUpdate() uses elapsed wall-clock time for bar-advance detection
-    // so the logic is timezone-agnostic (MT5 bridge returns broker-time, not UTC).
+    // Record wall-clock anchor for MT5 elapsed-time bar-advance (broker timestamps
+    // are not UTC so we can't compare last.time against Date.now()/1000 directly).
     this._candlesLoadedAt   = Date.now();
     this._lastBarTimeAtLoad = last ? last.time : 0;
+    this._barReloadPending  = false;
     this._startCandleCountdown();
+    this._startPeriodicReload();
   }
 
   // Apply a right-side gap so the last candle isn't flush against the price scale.
@@ -675,51 +679,52 @@ class ChartPane {
     }
 
     if (this.candles.length > 0) {
-      const intervalMs  = this._intervalToMs(this.interval);
-      const barDurSec   = Math.floor(intervalMs / 1000);
+      const intervalMs = this._intervalToMs(this.interval);
+      const barDurSec  = Math.floor(intervalMs / 1000);
+      const last       = this.candles[this.candles.length - 1];
 
-      // ── Timezone-safe bar advance ────────────────────────────────────────────
-      // MT5 bridge returns candles in broker server time (often UTC+2/UTC+3).
-      // Comparing last.time directly against Date.now()/1000 (UTC) would give a
-      // false "bar not ended" result for hours, causing all ticks to update the
-      // same candle forever.  Instead we measure *elapsed wall-clock seconds*
-      // since _renderCandles() loaded this batch — completely timezone-agnostic.
-      const elapsedSec  = (Date.now() - (this._candlesLoadedAt || Date.now())) / 1000;
-      const barsElapsed = intervalMs > 0 ? Math.floor(elapsedSec / barDurSec) : 0;
-      const last        = this.candles[this.candles.length - 1];
+      // ── Bar advance ──────────────────────────────────────────────────────────
+      // Strategy depends on data source time domain:
+      //
+      //   OANDA / yfinance: timestamps are true UTC unix seconds — compare
+      //     last.time + barDurSec directly against Date.now()/1000.
+      //
+      //   MT5: timestamps are broker server time (UTC+2/+3). Direct comparison
+      //     against Date.now()/1000 gives a 2-3h false offset so the bar never
+      //     advances. Use elapsed wall-clock time since _candlesLoadedAt instead.
+      //
+      // On new-bar detection: reload candles from the server (real OHLC, handles
+      // any gap including weekends/overnight). Guard with _barReloadPending flag.
+      // While reload is in flight, update the current bar's close optimistically.
 
-      if (intervalMs > 0 && barsElapsed > 0) {
-        // One or more new bars have elapsed since we loaded candles.
-        // Advance the series using broker-time arithmetic so LWC timestamps
-        // remain monotonically increasing within their own time domain.
-        const newBarTime = (this._lastBarTimeAtLoad || last.time) + barsElapsed * barDurSec;
-        // Only push if truly a new bar (guard against duplicate timestamps)
-        if (newBarTime > last.time) {
-          const newBar = { time: newBarTime, open: price, high: price, low: price, close: price };
-          this.candles.push(newBar);
-          try { this.candleSeries.update(newBar); } catch(e) {}
-          // ── CRITICAL: Re-anchor so next tick measures elapsed time from this
-          // new bar's start, not from the original candle-load time.
-          // Without this, barsElapsed stays >= 1 on every subsequent tick,
-          // newBarTime equals last.time (already pushed), newBarTime > last.time
-          // is false, and the bar never updates — or worse, a duplicate is pushed.
-          this._candlesLoadedAt   = Date.now() - ((elapsedSec % barDurSec) * 1000);
-          this._lastBarTimeAtLoad = newBarTime;
-        } else {
-          // barsElapsed advanced but newBarTime isn't newer — just update last
-          const updated = { ...last, close: price,
-            high: Math.max(last.high, price),
-            low:  Math.min(last.low,  price) };
-          this.candles[this.candles.length - 1] = updated;
-          try { this.candleSeries.update(updated); } catch(e) {}
-        }
-      } else {
-        const updated = { ...last, close: price,
-          high: Math.max(last.high, price),
-          low:  Math.min(last.low,  price) };
-        this.candles[this.candles.length - 1] = updated;
-        try { this.candleSeries.update(updated); } catch(e) {}
+      let newBarDetected = false;
+
+      if (this.source === 'mt5' && this._candlesLoadedAt) {
+        // MT5 path — elapsed wall-clock time (timezone-agnostic)
+        const elapsedSec  = (Date.now() - this._candlesLoadedAt) / 1000;
+        const barsElapsed = barDurSec > 0 ? Math.floor(elapsedSec / barDurSec) : 0;
+        if (barsElapsed > 0) newBarDetected = true;
+      } else if (barDurSec > 0) {
+        // OANDA / yfinance / hyperliquid — direct UTC comparison
+        const nowSec = Date.now() / 1000;
+        if (nowSec >= last.time + barDurSec) newBarDetected = true;
       }
+
+      if (newBarDetected && !this._barReloadPending) {
+        this._barReloadPending = true;
+        // 2s delay gives the broker time to finalise the just-closed bar
+        setTimeout(() => {
+          this._loadData(true).finally(() => { this._barReloadPending = false; });
+        }, 2000);
+      }
+
+      // Always update current bar's OHLC with the live tick (whether or not
+      // a reload is pending — keeps the chart moving while fetch is in flight)
+      const updated = { ...last, close: price,
+        high: Math.max(last.high, price),
+        low:  Math.min(last.low,  price) };
+      this.candles[this.candles.length - 1] = updated;
+      try { this.candleSeries.update(updated); } catch(e) {}
     }
   }
 
@@ -766,6 +771,33 @@ class ChartPane {
     if (this._countdownTimer) {
       clearInterval(this._countdownTimer);
       this._countdownTimer = null;
+    }
+  }
+
+  // ── Periodic candle reload ────────────────────────────────────────────────────
+  // Fires a full _loadData() once per bar duration as a safety net so the chart
+  // always catches up after weekends, overnight gaps, or long open sessions.
+  // The tick-based bar detection in onPriceUpdate() handles the common case;
+  // this timer handles the edge case where ticks stop (market closed) and the
+  // browser tab is left open until the market reopens.
+  _startPeriodicReload() {
+    this._stopPeriodicReload();
+    const intervalMs = this._intervalToMs(this.interval);
+    if (!intervalMs) return;
+    // Schedule reload at each bar boundary (interval duration), minimum 60s
+    const reloadMs = Math.max(intervalMs, 60000);
+    this._periodicReloadTimer = setInterval(() => {
+      if (!this._barReloadPending) {
+        this._barReloadPending = true;
+        this._loadData(true).finally(() => { this._barReloadPending = false; });
+      }
+    }, reloadMs);
+  }
+
+  _stopPeriodicReload() {
+    if (this._periodicReloadTimer) {
+      clearInterval(this._periodicReloadTimer);
+      this._periodicReloadTimer = null;
     }
   }
 
@@ -3882,6 +3914,11 @@ class ChartPane {
   setSource(src) {
     if (this.source === src) return;   // no-op if unchanged
     this._unsubscribeYF();
+    // Reset bar-advance state so the new source's time domain is used cleanly
+    this._barReloadPending  = false;
+    this._candlesLoadedAt   = null;
+    this._lastBarTimeAtLoad = 0;
+    this._stopPeriodicReload();
     this.source = src;
     this._loadData();
   }
@@ -4002,6 +4039,8 @@ class ChartPane {
 
   destroy() {
     this._unsubscribeYF();
+    this._stopCandleCountdown();
+    this._stopPeriodicReload();
     if (this._ro) { try { this._ro.disconnect(); } catch(e){} }
     Object.keys(this.subPanes).forEach(id => {
       try { this.subPanes[id].ro.disconnect(); } catch(e){}
