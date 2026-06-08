@@ -308,16 +308,33 @@ mt5_subs = {}   # symbol → prev_price
 mt5_lock  = threading.Lock()
 
 def mt5_poll_loop():
+    """
+    Poll the MT5 bridge for live prices and emit mt5_price socket events.
+    Uses the bulk /prices endpoint (one HTTP call per cycle) rather than
+    individual /price calls per symbol — eliminates cascading 404s on startup
+    and reduces bridge load significantly.
+    Subscribed symbols are registered with the bridge via /price on subscribe,
+    which adds them to the bridge's internal poller. /prices returns all cached.
+    """
+    import requests as _req
     while True:
         time.sleep(0.5)
         if not ds.MT5_ENABLED:
             continue
         with mt5_lock:
-            symbols = list(mt5_subs.keys())
-        for sym in symbols:
-            try:
-                info  = ds.mt5_get_price(sym)
-                price = info.get("price", 0)
+            symbols = set(mt5_subs.keys())
+        if not symbols:
+            continue
+        try:
+            r = _req.get(f"{ds._MT5_BASE}/prices", timeout=2)
+            if r.status_code != 200:
+                continue
+            bulk = r.json().get("prices", {})
+            for sym in symbols:
+                entry = bulk.get(sym)
+                if not entry:
+                    continue
+                price = float(entry.get("mid", 0))
                 if not price:
                     continue
                 prev = mt5_subs.get(sym) or price
@@ -326,12 +343,12 @@ def mt5_poll_loop():
                 socketio.emit("mt5_price", {
                     "symbol":     sym,
                     "price":      price,
-                    "change":     info.get("change", 0),
-                    "change_pct": info.get("change_pct", 0),
+                    "change":     0,
+                    "change_pct": 0,
                     "dir":        "up" if price >= prev else "down",
                 })
-            except Exception as e:
-                logger.warning(f"MT5 poll {sym}: {e}")
+        except Exception as e:
+            logger.warning(f"MT5 bulk poll error: {e}")
 
 threading.Thread(target=mt5_poll_loop, daemon=True).start()
 
@@ -540,6 +557,16 @@ def on_sub_yf(data):
     elif source == "mt5":
         with mt5_lock:
             mt5_subs.setdefault(sym_mt5, 0)
+        # Warm the bridge's internal poller by hitting /price once in the background.
+        # This triggers symbol_select + adds the symbol to the bridge's tick cache
+        # so the first /prices bulk poll has data immediately.
+        def _warm_mt5(sym):
+            try:
+                import requests as _r
+                _r.get(f"{ds._MT5_BASE}/price", params={"symbol": sym}, timeout=5)
+            except Exception:
+                pass
+        threading.Thread(target=_warm_mt5, args=(sym_mt5,), daemon=True).start()
     else:
         with yf_lock:
             yf_subs.setdefault(sym_raw, 0)
