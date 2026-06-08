@@ -748,14 +748,25 @@ class ChartPane {
       const intervalMs = this._intervalToMs(this.interval);
       if (!intervalMs || !this.candles.length) { el.textContent = ''; return; }
 
-      // ── Timezone-safe remaining time ─────────────────────────────────────────
-      // Use elapsed wall-clock time since candles were loaded, not candle.time vs
-      // Date.now(), so broker-time (UTC+2/+3) timestamps don't corrupt the display.
-      const barDurSec  = intervalMs / 1000;
-      const elapsedSec = (Date.now() - (this._candlesLoadedAt || Date.now())) / 1000;
-      const barsFull   = Math.floor(elapsedSec / barDurSec);
-      const secIntoBar = elapsedSec - barsFull * barDurSec;
-      let   remSec     = Math.max(0, barDurSec - secIntoBar);
+      const barDurSec = intervalMs / 1000;
+      let remSec;
+
+      if (this.source === 'mt5' && this._candlesLoadedAt) {
+        // MT5: broker timestamps are not UTC — use elapsed wall-clock time since
+        // the last bar was loaded/created, same approach as bar-advance detection.
+        const elapsedSec = (Date.now() - this._candlesLoadedAt) / 1000;
+        const secIntoBar = elapsedSec % barDurSec;
+        remSec = Math.max(0, barDurSec - secIntoBar);
+      } else {
+        // OANDA / yfinance / hyperliquid: candle timestamps are true UTC seconds.
+        // Use the last candle's open time to anchor exactly where we are in the
+        // bar cycle — stays correct after page reload, interval switches, and
+        // long sessions regardless of when _candlesLoadedAt was set.
+        const last      = this.candles[this.candles.length - 1];
+        const nowSec    = Date.now() / 1000;
+        const secIntoBar = (nowSec - last.time) % barDurSec;
+        remSec = Math.max(0, barDurSec - secIntoBar);
+      }
 
       el.textContent = '⏱ ' + this._formatCountdown(remSec, intervalMs);
 
@@ -775,28 +786,43 @@ class ChartPane {
   }
 
   // ── Periodic candle reload ────────────────────────────────────────────────────
-  // Fires a full _loadData() once per bar duration as a safety net so the chart
-  // always catches up after weekends, overnight gaps, or long open sessions.
-  // The tick-based bar detection in onPriceUpdate() handles the common case;
-  // this timer handles the edge case where ticks stop (market closed) and the
-  // browser tab is left open until the market reopens.
+  // Fires a full _loadData() at each real bar boundary so the chart always
+  // catches up after weekends, overnight gaps, or long open sessions.
   _startPeriodicReload() {
     this._stopPeriodicReload();
     const intervalMs = this._intervalToMs(this.interval);
     if (!intervalMs) return;
-    // Schedule reload at each bar boundary (interval duration), minimum 60s
-    const reloadMs = Math.max(intervalMs, 60000);
-    this._periodicReloadTimer = setInterval(() => {
-      if (!this._barReloadPending) {
-        this._barReloadPending = true;
-        this._loadData(true).finally(() => { this._barReloadPending = false; });
+    const barDurMs = Math.max(intervalMs, 60000);
+
+    const scheduleNext = () => {
+      // Calculate ms until the next bar boundary using real UTC time
+      // (falls back to barDurMs for MT5 where we can't compute a real boundary)
+      let msUntilNext = barDurMs;
+      if (this.source !== 'mt5' && this.candles.length) {
+        const last       = this.candles[this.candles.length - 1];
+        const nowSec     = Date.now() / 1000;
+        const secIntoBar = (nowSec - last.time) % (barDurMs / 1000);
+        msUntilNext = Math.max(5000, (barDurMs / 1000 - secIntoBar) * 1000 + 2000); // +2s broker delay
       }
-    }, reloadMs);
+      this._periodicReloadTimer = setTimeout(() => {
+        if (!this._barReloadPending) {
+          this._barReloadPending = true;
+          this._loadData(true).finally(() => {
+            this._barReloadPending = false;
+            scheduleNext(); // reschedule after each reload
+          });
+        } else {
+          scheduleNext(); // already reloading, just reschedule
+        }
+      }, msUntilNext);
+    };
+
+    scheduleNext();
   }
 
   _stopPeriodicReload() {
     if (this._periodicReloadTimer) {
-      clearInterval(this._periodicReloadTimer);
+      clearTimeout(this._periodicReloadTimer);
       this._periodicReloadTimer = null;
     }
   }
