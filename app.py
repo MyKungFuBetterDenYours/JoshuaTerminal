@@ -185,6 +185,9 @@ class OandaStreamManager:
         self._thread.start()
 
     def _run(self, instruments: list):
+        if ds.ACTIVE_FOREX_SOURCE != "oanda":
+            logger.info("OANDA stream: skipping — active source is not OANDA")
+            return
         if not ds.OANDA_API_KEY or not ds.OANDA_ACCOUNT_ID:
             logger.error("OANDA stream: missing API key or account ID — cannot stream")
             return
@@ -262,8 +265,8 @@ class OandaStreamManager:
             except Exception as e:
                 if self._stop_flag.is_set():
                     break
-                logger.error(f"OANDA stream error: {e} — reconnecting in 5s")
-                time.sleep(5)
+                logger.error(f"OANDA stream error: {e} — reconnecting in 30s")
+                time.sleep(30)
 
         logger.info("OANDA stream thread stopped")
 
@@ -553,6 +556,9 @@ def on_sub_yf(data):
     sym_mt5  = _norm_sym(raw)   # EURUSD — for mt5_subs key and emit
     sym_raw  = raw.upper()      # EUR/USD — for OANDA/YF which handle formatting
     if source == "oanda":
+        if ds.ACTIVE_FOREX_SOURCE != "oanda":
+            logger.debug(f"Ignoring OANDA subscribe for {sym_raw} — active source is {ds.ACTIVE_FOREX_SOURCE}")
+            return
         oanda_stream.subscribe(sym_raw)
     elif source == "mt5":
         with mt5_lock:
