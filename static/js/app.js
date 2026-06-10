@@ -141,7 +141,7 @@ const App = (() => {
     socket.on('mt5_price', data => {
       if (globalSource !== 'mt5') return;
       panes.forEach(p => {
-        if (p.source === 'mt5' && norm(p.symbol) === norm(data.symbol)) {
+        if (p.source !== 'hyperliquid' && norm(p.symbol) === norm(data.symbol)) {
           p.onPriceUpdate(data);
         }
       });
@@ -152,7 +152,7 @@ const App = (() => {
       setDot('dot-oanda', 'live');
       if (globalSource !== 'oanda') return;
       panes.forEach(p => {
-        if (p.source === 'oanda' && norm(p.symbol) === norm(data.symbol)) {
+        if (p.source !== 'hyperliquid' && norm(p.symbol) === norm(data.symbol)) {
           p.onPriceUpdate(data);
         }
       });
@@ -162,7 +162,7 @@ const App = (() => {
     socket.on('yf_price', data => {
       if (globalSource !== 'yfinance') return;
       panes.forEach(p => {
-        if (p.source === 'yfinance' && norm(p.symbol) === norm(data.symbol)) {
+        if (p.source !== 'hyperliquid' && norm(p.symbol) === norm(data.symbol)) {
           p.onPriceUpdate(data);
         }
       });
