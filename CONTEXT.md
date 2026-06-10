@@ -1,5 +1,5 @@
 # Joshua Terminal — Claude Context File
-_Last updated: Global source architecture — per-pane source dropdown removed; single global forex source selector in topbar; symbol-driven source auto-detection; MT5 candle routing bug fixed; bar-advance logic made timezone-agnostic_
+_Last updated: Live price streaming debugging session — mt5_bridge.py missing @app.route decorator on /price fixed; OANDA stream reconnect backoff 5s→30s; app.js price event handlers fixed to route by `source !== 'hyperliquid'` instead of strict source equality; awaiting multi-day stability confirmation before next feature work_
 
 ---
 
@@ -425,6 +425,44 @@ SNAPSHOT_KEEP_DAYS=7        # optional — passed through to JT
 
 ---
 
+
+## Session Notes — 2026-06-10 (Live Price Streaming Fixes)
+
+### Problem
+After switching to MT5 as the active source, live price heartbeats stopped on all panes. OANDA stream errors were also flooding the logs even when OANDA was not selected.
+
+### Root causes found (in order of discovery)
+
+#### 1. OANDA stream spamming DNS errors (app.py)
+The OANDA `OandaStreamManager` was reconnecting every 5 seconds when `stream-fxtrade.oanda.com` was unreachable (network issue). Because it runs in a gevent greenlet, the tight 5s retry loop was starving MT5 price emission greenlets. **Fix:** increased reconnect backoff from 5s to 30s.
+
+#### 2. mt5_bridge.py — missing @app.route decorator on /price (CRITICAL)
+The `/price` route in `mt5_bridge.py` had its `@app.route("/price", methods=["GET"])` decorator accidentally removed. Flask never registered the endpoint, so all `/price?symbol=EURUSD` calls returned 404. Since `/price` is how symbols get added to `_subscribed` (the poller's symbol list) and the tick cache, `/prices` always returned `{}` — meaning `mt5_poll_loop` in `app.py` received no ticks and never emitted `mt5_price` events. **Fix:** restore the decorator above `def price():`.
+
+This only manifested after a bridge restart (symbols were retained in memory from a prior run).
+
+#### 3. app.js price event handlers — strict source equality (app.js)
+`mt5_price`, `oanda_price`, and `yf_price` socket handlers gated on `p.source === 'mt5'` etc. But panes restore `p.source` from localStorage, which may reflect a prior session's source. When the active source changes, pane source values lag behind `globalSource`. **Fix:** changed all three handlers to `p.source !== 'hyperliquid'` — any non-crypto pane receives ticks when the global source matches.
+
+### Diagnostic approach
+Tested the data pipeline manually before touching code:
+```bash
+curl http://192.168.1.20:5006/health       # bridge alive ✅
+curl http://192.168.1.20:5006/timezone     # offset returned ✅
+curl "http://192.168.1.20:5006/price?symbol=EURUSD"  # 404 ← root cause
+curl http://192.168.1.20:5006/prices       # {} ← confirmed empty cache
+curl "http://192.168.1.20:5006/candles?symbol=EURUSD&interval=5m&limit=5"  # candles ok ✅
+```
+
+### Files changed
+- `mt5_bridge.py` — restore `@app.route("/price", methods=["GET"])` decorator (Windows bridge, must be redeployed manually)
+- `app.py` — reconnect backoff 5s → 30s
+- `app.js` — price event handler routing fix
+
+### Status
+Confirmed working (heartbeats visible on all panes, both MT5 and OANDA). Halting feature work pending multi-day stability confirmation.
+
+---
 ## Bucket List (future sessions)
 - [ ] **Timezone timescale fix** — after `applyTimezone()` changes `tickMarkFormatter`, force a timescale redraw so axis labels update immediately without requiring a scroll/reload
 - [ ] **Web search in analysis** — add `web_search` tool to `client.messages.create()` in `run_analysis.py`
