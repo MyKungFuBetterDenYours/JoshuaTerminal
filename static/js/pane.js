@@ -89,6 +89,7 @@ class ChartPane {
     this._fibPreview      = null;   // { priceA, priceB } canvas preview during drag
     this._fibRafId        = null;   // rAF handle for throttled preview redraws
     this._fibPreviewPrice = null;   // latest price seen during drag
+    this._renderRafId     = null;   // rAF handle for shared crosshair repaint scheduler
 
     // ── Trendline state ──────────────────────────────────
     this._trendlines      = [];   // [{ id, color, ptA:{price,time}, ptB:{price,time} }]
@@ -1272,12 +1273,8 @@ class ChartPane {
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this._trendRender());
     // Persist bar spacing whenever the user zooms/scrolls
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this._saveBarSpacing());
-    // Throttle: coalesce rapid crosshair events into one rAF redraw
-    let _trendRafId = null;
-    this.chart.subscribeCrosshairMove(() => {
-      if (_trendRafId) return;
-      _trendRafId = requestAnimationFrame(() => { _trendRafId = null; this._trendRender(); });
-    });
+    // Crosshair move: throttled via shared rAF scheduler
+    this.chart.subscribeCrosshairMove(() => this._scheduleRender());
     // ── Chart-level events for drawing tools and trendline interaction ────────
     chartEl.addEventListener('mousedown', e => this._onDrawMouseDown(e));
     chartEl.addEventListener('mousemove', e => this._onDrawMouseMove(e));
@@ -1917,7 +1914,8 @@ class ChartPane {
 
     // Redraw on scroll / zoom
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this._renderAllPositions());
-    this.chart.subscribeCrosshairMove(() => this._renderAllPositions());
+    // Crosshair move: throttled via shared rAF scheduler (positions have hover state)
+    this.chart.subscribeCrosshairMove(() => this._scheduleRender());
   }
 
   _renderAllPositions() {
@@ -2574,9 +2572,8 @@ class ChartPane {
       this._sdRender();
     }).observe(chartEl);
 
-    // Redraw on scroll / zoom / crosshair
+    // Redraw on scroll / zoom only — SD zones don't use crosshair position
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this._sdRender());
-    this.chart.subscribeCrosshairMove(() => this._sdRender());
   }
 
   _sdRender() {
@@ -2697,7 +2694,7 @@ class ChartPane {
       this._obRender();
     }).observe(chartEl);
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this._obRender());
-    this.chart.subscribeCrosshairMove(() => this._obRender());
+    // Order Blocks don't use crosshair position — no subscribeCrosshairMove needed
   }
 
   _obRender() {
@@ -2811,7 +2808,7 @@ class ChartPane {
       this._fvgRender();
     }).observe(chartEl);
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this._fvgRender());
-    this.chart.subscribeCrosshairMove(() => this._fvgRender());
+    // FVG zones don't use crosshair position — no subscribeCrosshairMove needed
   }
 
   _fvgRender() {
@@ -2960,6 +2957,18 @@ class ChartPane {
         ctx.fillText('FVG DYN ▼', W - 4, y + 11);
       }
     }
+  }
+
+  // ── Shared rAF render scheduler ───────────────────────────────────────────────
+  // All subscribeCrosshairMove callbacks funnel here so at most one repaint
+  // fires per animation frame regardless of how many canvases are active.
+  _scheduleRender() {
+    if (this._renderRafId) return;
+    this._renderRafId = requestAnimationFrame(() => {
+      this._renderRafId = null;
+      this._trendRender();
+      this._renderAllPositions();
+    });
   }
 
   _trendRender() {
@@ -4031,6 +4040,8 @@ class ChartPane {
     this._unsubscribeYF();
     this._stopCandleCountdown();
     this._stopPeriodicReload();
+    if (this._renderRafId) { cancelAnimationFrame(this._renderRafId); this._renderRafId = null; }
+    if (this._fibRafId)    { cancelAnimationFrame(this._fibRafId);    this._fibRafId    = null; }
     if (this._ro) { try { this._ro.disconnect(); } catch(e){} }
     Object.keys(this.subPanes).forEach(id => {
       try { this.subPanes[id].ro.disconnect(); } catch(e){}
