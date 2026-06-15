@@ -476,12 +476,20 @@ class ChartPane {
       }
 
       this.candles = this._dedup(data.candles);
-      this._renderCandles();
-      this._renderActiveIndicators();
+      this._renderCandles(silentReload);
+      this._renderActiveIndicators(silentReload);
       if (!silentReload) {
         this._subscribeYF();
-        // Restore saved state (drawings shared across intervals, indicators per-interval)
         this._restoreState();
+      } else {
+        // Silent bar-close reload: preserve drawings and viewport.
+        // Re-extend fib LWC series to new candle range, then repaint canvases.
+        this._refreshFibEndpoints();
+        this._trendRender();
+        this._renderAllPositions();
+        if (this._sdCanvas  && this._sdData)  this._sdRender();
+        if (this._obCanvas  && this._obData)  this._obRender();
+        if (this._fvgCanvas && this._fvgData) this._fvgRender();
       }
 
     } catch(e) {
@@ -499,15 +507,25 @@ class ChartPane {
       .sort((a,b) => a.time - b.time);
   }
 
-  _renderCandles() {
+  _renderCandles(silent = false) {
     const last = this.candles[this.candles.length - 1];
     if (last) this.currentPrice = last.close;
 
-    // ── Recreate the candleSeries on every render ─────────────────────────────
-    // LWC v4 can get confused about bar spacing when setData() is called with a
-    // completely different time interval on an existing series (e.g. 15m → 4h).
-    // Removing and recreating the series forces LWC to infer the new bar spacing
-    // cleanly from the incoming timestamps, eliminating candle alignment gaps.
+    if (silent && this.candleSeries) {
+      // ── Silent bar-close reload: preserve series, viewport, zoom ─────────────
+      // Just push fresh data onto the existing series — no remove/recreate,
+      // no fitContent, no barSpacing reset. The user sees zero visual disruption.
+      try { this.candleSeries.setData(this.candles); } catch(e) {}
+      if (last) this._updateTicker(last.close, last.close, 0, 0, 'up');
+      this._barReloadPending = false;
+      this._startCandleCountdown();
+      this._startPeriodicReload();
+      return;
+    }
+
+    // ── Full render (symbol/interval switch or initial load) ──────────────────
+    // Recreate candleSeries so LWC v4 infers bar spacing cleanly from the new
+    // timestamps (fixes candle alignment when switching e.g. 15m → 4h).
     if (this.candleSeries) {
       try { this.chart.removeSeries(this.candleSeries); } catch(e) {}
     }
@@ -864,10 +882,162 @@ class ChartPane {
     return true;
   }
 
-  _renderActiveIndicators() {
+  _renderActiveIndicators(silent = false) {
+    if (silent) {
+      // Bar-close reload: update indicator data in place, preserving all series
+      // and subpane charts. No teardown, no viewport disruption.
+      this._refreshIndicatorData();
+      return;
+    }
     for (const id of [...this.activeIndicators]) {
       this._removeIndicator(id);
       this._addIndicator(id);
+    }
+  }
+
+  // ── Silent-reload helpers ─────────────────────────────────────────────────────
+
+  // Update all active indicator series data in place without recreating anything.
+  _refreshIndicatorData() {
+    const c = this.candles;
+    if (!c.length) return;
+
+    const upd = (s, data) => {
+      if (!s || !data || !data.length) return;
+      try { s.setData(data); } catch(e) {}
+    };
+
+    for (const id of this.activeIndicators) {
+      const s = this.indicatorSeries[id];
+      if (!s) continue;
+      try {
+        switch (id) {
+          case 'sma20':  upd(s, Indicators.sma(c, 20));  break;
+          case 'sma50':  upd(s, Indicators.sma(c, 50));  break;
+          case 'sma200': upd(s, Indicators.sma(c, 200)); break;
+          case 'ema20':  upd(s, Indicators.ema(c, 20));  break;
+          case 'ema50':  upd(s, Indicators.ema(c, 50));  break;
+          case 'ema200': upd(s, Indicators.ema(c, 200)); break;
+          case 'vwap':   upd(s, Indicators.vwap(c));     break;
+          case 'vwma':   upd(s, Indicators.vwma(c, 20)); break;
+          case 'bb': {
+            const { upper, middle, lower } = Indicators.bollingerBands(c);
+            upd(s.upper, upper); upd(s.middle, middle); upd(s.lower, lower); break;
+          }
+          case 'donchian': {
+            const { upper, lower, middle } = Indicators.donchian(c);
+            upd(s.upper, upper); upd(s.middle, middle); upd(s.lower, lower); break;
+          }
+          case 'keltner': {
+            const { upper, lower, middle } = Indicators.keltner(c);
+            upd(s.upper, upper); upd(s.middle, middle); upd(s.lower, lower); break;
+          }
+          case 'ichimoku': {
+            const { tenkan, kijun, chikouSpan, senkouA, senkouB } = Indicators.ichimoku(c);
+            upd(s.tenkan, tenkan); upd(s.kijun, kijun); upd(s.chikou, chikouSpan);
+            upd(s.senkouA, senkouA); upd(s.senkouB, senkouB); break;
+          }
+          case 'psar': {
+            const sarData = Indicators.parabolicSAR(c);
+            upd(s.up, sarData.filter(d =>  d.isLong).map(d => ({ time: d.time, value: d.value })));
+            upd(s.dn, sarData.filter(d => !d.isLong).map(d => ({ time: d.time, value: d.value }))); break;
+          }
+          case 'supertrend': {
+            const st = Indicators.supertrend(c);
+            upd(s.up, st.filter(d => d.trend ===  1).map(d => ({ time: d.time, value: d.value })));
+            upd(s.dn, st.filter(d => d.trend === -1).map(d => ({ time: d.time, value: d.value }))); break;
+          }
+          case 'pivots': {
+            const pts = Indicators.pivotPoints(c);
+            if (Array.isArray(s)) {
+              s.forEach((ser, i) => {
+                if (!pts[i]) return;
+                upd(ser, [{ time: c[0].time, value: pts[i].value }, { time: c[c.length-1].time, value: pts[i].value }]);
+              });
+            } break;
+          }
+          case 'volume':   upd(s, Indicators.volumeBars(c)); break;
+          case 'rsi':      upd(s, Indicators.rsi(c)); break;
+          case 'atr':      upd(s, Indicators.atr(c)); break;
+          case 'adx':      upd(s, Indicators.adx(c)); break;
+          case 'cci':      upd(s, Indicators.cci(c)); break;
+          case 'obv':      upd(s, Indicators.obv(c)); break;
+          case 'mfi':      upd(s, Indicators.mfi(c)); break;
+          case 'williams': upd(s, Indicators.williamsR(c)); break;
+          case 'momentum': upd(s, Indicators.momentum(c, 10)); break;
+          case 'sd_zones_auto_fib': {
+            if (this._sdCanvas) {
+              const result = Indicators.sdZonesAutoFib(c, 3, 10, 0.1, 5, true,
+                [0.0, 0.5, 0.618, 0.786, 0.88, 1.0, -0.27, -0.618]);
+              this._sdData = {
+                supplyZones: (result.supplyZones || []).map(z => ({
+                  t0: c[z.leftIdx].time, t1: c[z.rightIdx].time,
+                  top: z.top, bottom: z.bottom,
+                })),
+                demandZones: (result.demandZones || []).map(z => ({
+                  t0: c[z.leftIdx].time, t1: c[z.rightIdx].time,
+                  top: z.top, bottom: z.bottom,
+                })),
+                fibLevels: result.fibLevels || [],
+              };
+              this._sdRender();
+            } break;
+          }
+          case 'order_blocks': {
+            if (this._obCanvas) {
+              const result = Indicators.orderBlocks(c, 25, false, false, false);
+              this._obData = {
+                bearishBlocks: result.bearishBlocks,
+                bullishBlocks: result.bullishBlocks,
+                bosLines:      result.bosLines,
+              };
+              this._obRender();
+            } break;
+          }
+          case 'fvg_luxalgo': {
+            if (this._fvgCanvas) {
+              const params = (this.indicatorParams && this.indicatorParams['fvg_luxalgo']) || {};
+              const result = Indicators.FairValueGap(c,
+                params.thresholdPer  ?? 0,
+                params.autoThreshold ?? false,
+                params.showLast      ?? 0,
+                params.dynamic       ?? false);
+              this._fvgData = result;
+              this._fvgRender();
+            } break;
+          }
+          // Multi-series subpane indicators: full rebuild (fires once per bar, acceptable)
+          case 'macd':
+          case 'stoch':
+          case 'stochrsi': {
+            this._removeIndicator(id);
+            this._addIndicator(id);
+            break;
+          }
+          default: break;
+        }
+      } catch(e) {
+        try { this._removeIndicator(id); this._addIndicator(id); } catch(e2) {}
+      }
+    }
+  }
+
+  // Re-extend fib LWC line series endpoints to the latest candle timestamp.
+  // After a silent bar-close reload the candle array has a new last time;
+  // fib series still end at the old timestamp making them invisible at right
+  // edge until a full redraw occurs. This fixes that with a cheap setData call.
+  _refreshFibEndpoints() {
+    if (!this.candles.length || !this._fibs.length) return;
+    const t0 = this.candles[0].time;
+    const t1 = this.candles[this.candles.length - 1].time;
+    for (const fib of this._fibs) {
+      const range = fib.priceB - fib.priceA;
+      fib.series.forEach((s, i) => {
+        const level = this.fibLevels[i];
+        if (level === undefined || !s) return;
+        const price = fib.priceA + range * level;
+        try { s.setData([{ time: t0, value: price }, { time: t1, value: price }]); } catch(e) {}
+      });
     }
   }
 
