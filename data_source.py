@@ -536,3 +536,150 @@ def get_price(symbol: str) -> dict:
 
 def get_active_source() -> str:
     return ACTIVE_FOREX_SOURCE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Historical data layer — chunked range fetching + SQLite cache
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared primitive for pane "load more" and the future backtesting engine.
+# OANDA caps a single request at 5000 candles; oanda_get_candles_range()
+# walks from/to in chunks (per OANDA's own documented pagination pattern —
+# see InstrumentsCandlesFactory) and get_historical_candles() layers the
+# local cache on top so repeat requests for the same range hit disk, not
+# the live API.
+
+_GRANULARITY_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H2": 7200, "H4": 14400, "H8": 28800, "H12": 43200,
+    "D": 86400, "W": 604800,
+}
+
+
+def oanda_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: int) -> list:
+    """
+    Fetch ALL complete OANDA candles in [start_ts, end_ts] (unix seconds, UTC),
+    chunking automatically past the 5000-candle-per-request cap. Returns
+    ascending, deduped-by-time. This is a range fetch only — no cache lookup
+    here, no fallback chain. Callers wanting cache-awareness should use
+    get_historical_candles() below.
+    """
+    if not OANDA_API_KEY:
+        logger.warning("oanda_get_candles_range: no OANDA API key — returning empty")
+        return []
+
+    import requests
+
+    instrument  = _oanda_instrument(symbol)
+    granularity = OANDA_GRANULARITY.get(interval, "M15")
+    bar_secs    = _GRANULARITY_SECONDS.get(granularity, 900)
+
+    # Leave a small safety margin under 5000 in case of off-by-one at edges.
+    chunk_secs = bar_secs * 4900
+
+    url = f"{_OANDA_BASE}/v3/instruments/{instrument}/candles"
+    all_candles = []
+    chunk_start = start_ts
+    chunks_done = 0
+    max_chunks  = 50  # safety cap — prevents a runaway loop on bad input
+
+    while chunk_start <= end_ts and chunks_done < max_chunks:
+        chunk_end = min(chunk_start + chunk_secs, end_ts)
+
+        from_str = datetime.fromtimestamp(chunk_start, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000000000Z")
+        to_str = datetime.fromtimestamp(chunk_end, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000000000Z")
+
+        params = {
+            "granularity":  granularity,
+            "from":         from_str,
+            "to":           to_str,
+            "price":        "M",
+            "smooth":       "false",
+            "includeFirst": "true",  # avoid a 1-bar gap at chunk boundaries
+        }
+
+        try:
+            r = requests.get(url, headers=_oanda_headers(), params=params, timeout=15)
+            if r.status_code != 200:
+                logger.error(f"OANDA range fetch {r.status_code} for {instrument} "
+                             f"[{from_str} -> {to_str}]: {r.text[:200]}")
+                break
+            data = r.json()
+        except Exception as e:
+            logger.error(f"OANDA range fetch error {instrument}: {e}")
+            break
+
+        chunk_candles = []
+        for c in data.get("candles", []):
+            if not c.get("complete", True):
+                continue  # skip the still-forming bar — historical fetch only
+            mid = c.get("mid", {})
+            try:
+                ts = datetime.strptime(c["time"][:19], "%Y-%m-%dT%H:%M:%S").replace(
+                    tzinfo=timezone.utc)
+                chunk_candles.append({
+                    "time":   int(ts.timestamp()),
+                    "open":   float(mid["o"]),
+                    "high":   float(mid["h"]),
+                    "low":    float(mid["l"]),
+                    "close":  float(mid["c"]),
+                    "volume": float(c.get("volume", 0)),
+                })
+            except (KeyError, ValueError) as e:
+                logger.debug(f"Skipping candle in range fetch {c}: {e}")
+
+        if not chunk_candles:
+            # Empty window (e.g. before the instrument existed, or a weekend-
+            # only span) — advance and keep going rather than treating as fatal.
+            chunk_start = chunk_end + bar_secs
+            chunks_done += 1
+            continue
+
+        all_candles.extend(chunk_candles)
+        # Advance past the last candle we actually received so the next
+        # chunk's includeFirst can't re-fetch a duplicate at the seam.
+        chunk_start = chunk_candles[-1]["time"] + bar_secs
+        chunks_done += 1
+
+    if chunks_done >= max_chunks:
+        logger.warning(f"OANDA range fetch hit max_chunks={max_chunks} for "
+                        f"{instrument} {interval} — range may be incomplete "
+                        f"for requested [{start_ts}, {end_ts}]")
+
+    # Defensive dedup (PK-style) in case of any edge-case overlap, then sort.
+    deduped = {c["time"]: c for c in all_candles}
+    return sorted(deduped.values(), key=lambda x: x["time"])
+
+
+def get_historical_candles(symbol: str, interval: str, start_ts: int, end_ts: int,
+                            source: str = None) -> list:
+    """
+    Shared data primitive for pane loading AND the future backtesting engine.
+    Returns candles in [start_ts, end_ts], backed by the local SQLite cache —
+    only the missing head/tail of the range is fetched from the live source;
+    everything already cached is served from disk.
+
+    Currently OANDA-only for the range-fetch path (it's the deepest, most
+    reliable live history source you have). MT5/yfinance range-fetching can
+    be added the same way later if backtesting needs them too.
+    """
+    import candle_cache as cc
+
+    src = source or ACTIVE_FOREX_SOURCE
+    if src != "oanda":
+        logger.warning(f"get_historical_candles: range-fetch not yet implemented "
+                        f"for source={src} — only 'oanda' is supported today")
+        return cc.get_cached_range(symbol.upper(), interval, start_ts, end_ts)
+
+    cache_key   = _oanda_instrument(symbol)
+    granularity = OANDA_GRANULARITY.get(interval, "M15")
+    bar_secs    = _GRANULARITY_SECONDS.get(granularity, 900)
+
+    gaps = cc.find_missing_ranges(cache_key, interval, start_ts, end_ts, bar_secs)
+    for gap_start, gap_end in gaps:
+        fresh = oanda_get_candles_range(symbol, interval, gap_start, gap_end)
+        if fresh:
+            cc.upsert_candles(cache_key, interval, fresh, source="oanda")
+
+    return cc.get_cached_range(cache_key, interval, start_ts, end_ts)
