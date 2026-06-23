@@ -10,3 +10,4 @@ __pycache__/
 .venv
 snapshot_state.json
 templates/pine-converter.html
+data/
