@@ -10,6 +10,8 @@
 | OANDA account | Practice or Live | Optional — free at oanda.com. Not needed if using MT5 |
 | MetaTrader 5 | Any recent build | Optional — Windows only. Free demo accounts available from most brokers |
 
+> **Windows users:** install the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) before installing Python dependencies. `gevent`/`greenlet` ship compiled extensions that require it — without it you'll hit a `DLL load failed while importing _greenlet` error on startup.
+
 > **macOS service:** If you plan to run Joshua Terminal as a background service via launchd, see [Section 8 — Run as a macOS Service](#8-run-as-a-macos-service).
 
 ---
@@ -388,6 +390,7 @@ On Linux, launchd is replaced by systemd. The Python code and `.env` are identic
 | MT5 bridge timeout on first request | Normal on very first symbol load — bridge is adding symbol to Market Watch. Subsequent requests are instant |
 | MT5 wrong symbol name | Call `http://<bridge-ip>:5006/symbols?q=EUR` to see your broker's exact symbol names |
 | MT5 prices loading but candles empty | Symbol may not have history on this broker/timeframe. Try a different interval |
+| `DLL load failed while importing _greenlet` on Windows | Missing Visual C++ Redistributable. Install [vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe), then force a clean reinstall: `uv run pip uninstall -y greenlet gevent` followed by `uv sync --reinstall-package greenlet --reinstall-package gevent` |
 | Telegram alerts not firing | Check `TELEGRAM_CHAT_ID` — group chat IDs are negative numbers |
 | Drawings disappeared | Click SAVE — drawings are not auto-saved. Check Saved States manager |
 | Snapshot returns 500 | Check JT console for error. Ensure `playwright install chromium` was run with the same Python that runs `app.py` |
