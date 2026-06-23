@@ -674,6 +674,14 @@ if __name__ == "__main__":
         print("  ║  ⚠  No SSL — PWA will show browser UI           ║")
     print("  ╚" + "═"*47 + "╝\n")
     hl_manager.start()
-    socketio.run(app, host="0.0.0.0", port=5050, debug=False,
-                 use_reloader=False, ssl_context=ssl_ctx,
-                 allow_unsafe_werkzeug=True)
+
+    # ── Only pass ssl_context when it's a real SSLContext ─────────────────────
+    # Newer gevent (26.x) treats ssl_context=None as "render SSL anyway" rather
+    # than "no SSL" — the key being present at all triggers wrap_socket on None.
+    # Omitting the kwarg entirely when there's no cert avoids the crash.
+    _run_kwargs = dict(host="0.0.0.0", port=5050, debug=False,
+                        use_reloader=False, allow_unsafe_werkzeug=True)
+    if ssl_ctx:
+        _run_kwargs["ssl_context"] = ssl_ctx
+
+    socketio.run(app, **_run_kwargs)
