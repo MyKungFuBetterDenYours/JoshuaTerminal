@@ -156,6 +156,61 @@ def _oanda_instrument(symbol: str) -> str:
     return aliases.get(s_noslash, s)
 
 
+def oanda_get_live_bar(symbol: str, interval: str, after_ts: int) -> dict:
+    """
+    Fetch the currently-forming (incomplete) OANDA candle that starts after
+    `after_ts` (unix seconds, UTC — normally the timestamp of the last
+    complete bar you already have). Returns a single candle dict, or None
+    if there isn't a newer bar yet (e.g. market closed, or called right at
+    a boundary before OANDA has started the next bar).
+
+    This is a best-effort, single-candle fetch — used to give the frontend
+    a "live" bar to anchor price-tick updates onto, separate from the
+    historical (complete-bars-only) cache path. Never raises; returns None
+    on any failure so callers can treat it as optional.
+    """
+    if not OANDA_API_KEY:
+        return None
+
+    import requests
+
+    instrument  = _oanda_instrument(symbol)
+    granularity = OANDA_GRANULARITY.get(interval, "M15")
+    url = f"{_OANDA_BASE}/v3/instruments/{instrument}/candles"
+
+    from_dt = datetime.fromtimestamp(after_ts, tz=timezone.utc)
+    from_str = (from_dt + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
+    params = {
+        "granularity": granularity,
+        "from":        from_str,
+        "price":       "M",
+        "count":       "1",
+    }
+    try:
+        r = requests.get(url, headers=_oanda_headers(), params=params, timeout=5)
+        if r.status_code != 200:
+            return None
+        for c in r.json().get("candles", []):
+            mid = c.get("mid", {})
+            try:
+                ts = datetime.strptime(c["time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                t  = int(ts.timestamp())
+                if t > after_ts:
+                    return {
+                        "time":   t,
+                        "open":   float(mid["o"]),
+                        "high":   float(mid["h"]),
+                        "low":    float(mid["l"]),
+                        "close":  float(mid["c"]),
+                        "volume": float(c.get("volume", 0)),
+                    }
+            except (KeyError, ValueError):
+                pass
+    except Exception:
+        pass  # best-effort — caller treats None as "no live bar available"
+    return None
+
+
 def oanda_get_candles(symbol: str, interval: str = "15m", limit: int = 300) -> list:
     """
     Fetch OHLCV candles from OANDA v20 REST API.
@@ -221,43 +276,10 @@ def oanda_get_candles(symbol: str, interval: str = "15m", limit: int = 300) -> l
 
         # ── Fetch the currently-forming (incomplete) candle separately ───────
         # OANDA's count-based request returns only complete candles.
-        # We request count=1 from the last candle's close time to get the
-        # live bar that is currently forming.
         if candles:
-            last_complete_time = candles[-1]["time"]
-            from_dt = datetime.fromtimestamp(last_complete_time, tz=timezone.utc)
-            # Request from just after the last complete bar
-            from_str = (from_dt + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
-            live_params = {
-                "granularity": granularity,
-                "from":        from_str,
-                "price":       "M",
-                "count":       "1",
-            }
-            try:
-                r2 = requests.get(url, headers=_oanda_headers(), params=live_params, timeout=5)
-                if r2.status_code == 200:
-                    live_data = r2.json()
-                    for c in live_data.get("candles", []):
-                        mid = c.get("mid", {})
-                        try:
-                            ts = datetime.strptime(c["time"][:19], "%Y-%m-%dT%H:%M:%S")
-                            ts = ts.replace(tzinfo=timezone.utc)
-                            t  = int(ts.timestamp())
-                            # Only append if it's a new bar (not a duplicate)
-                            if t > last_complete_time:
-                                candles.append({
-                                    "time":   t,
-                                    "open":   float(mid["o"]),
-                                    "high":   float(mid["h"]),
-                                    "low":    float(mid["l"]),
-                                    "close":  float(mid["c"]),
-                                    "volume": float(c.get("volume", 0)),
-                                })
-                        except (KeyError, ValueError):
-                            pass
-            except Exception:
-                pass  # live bar fetch is best-effort; don't fail the whole request
+            live_bar = oanda_get_live_bar(symbol, interval, candles[-1]["time"])
+            if live_bar:
+                candles.append(live_bar)
 
         candles.sort(key=lambda x: x["time"])
         return candles[-limit:]
@@ -490,6 +512,109 @@ def mt5_get_candles(symbol: str, interval: str = "15m", limit: int = 300) -> lis
     return yfinance_get_candles(symbol, interval, limit)
 
 
+def mt5_get_live_bar(symbol: str, interval: str, after_ts: int) -> dict:
+    """
+    Return the single most-recent MT5 bar if it's newer than after_ts — the
+    live anchor bar for pane.js's onPriceUpdate(), mirroring
+    oanda_get_live_bar(). mt5_get_candles_range() deliberately filters out
+    the still-forming bar (no "complete" flag to rely on, see its docstring),
+    so the cache-fed historical list never includes it. This fills that gap
+    using mt5_get_candles()'s pos-based fetch, which naturally includes
+    whatever bar is currently forming — exactly what's needed here, not a
+    problem to filter out this time.
+
+    Returns None if the bridge is unreachable or the most recent bar isn't
+    actually newer than what's already in hand (e.g. market closed).
+    """
+    try:
+        recent = mt5_get_candles(symbol, interval, limit=1)
+    except Exception as e:
+        logger.debug(f"mt5_get_live_bar failed for {symbol} {interval}: {e}")
+        return None
+    if not recent:
+        return None
+    bar = recent[-1]
+    return bar if bar["time"] > after_ts else None
+
+
+def mt5_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: int) -> tuple:
+    """
+    Fetch MT5 candles for an arbitrary [start_ts, end_ts] UTC range — the MT5
+    equivalent of oanda_get_candles_range(). Unlike mt5_get_candles() (which
+    asks for "the last N bars"), this hits the bridge's /candles_range
+    endpoint (backed by MT5's copy_rates_range) so the cache layer can fill
+    a specific historical window for backtesting.
+
+    No chunking needed here — unlike OANDA's 5000-per-request cap, MT5 has
+    no such limit; you get whatever the local terminal has cached for the
+    range in one call.
+
+    Returns (candles, confirmed) — confirmed is True only if the bridge
+    actually answered for this range (even with zero candles back, e.g. a
+    weekend or pre-listing history). confirmed=False means the request
+    itself failed (bridge unreachable, wrong route/404, bad response) and
+    the caller must NOT treat that as "checked empty" — doing so would let
+    candle_cache silently mark a real outage as confirmed-empty and stop
+    retrying it.
+    """
+    import requests as _requests
+
+    sym = symbol.upper().replace("/", "").replace("-", "").replace("_", "").replace("=X", "")
+    tz_offset = _fetch_mt5_tz_offset()
+
+    try:
+        r = _requests.get(
+            f"{_MT5_BASE}/candles_range",
+            params={"symbol": sym, "interval": interval, "from_ts": start_ts, "to_ts": end_ts},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            logger.error(f"MT5 bridge /candles_range returned {r.status_code} for "
+                         f"{sym} {interval} [{start_ts}, {end_ts}] — treating as "
+                         f"UNCONFIRMED (likely a stale/outdated bridge deployment "
+                         f"missing this route, not 'no data')")
+            return [], False
+
+        data = r.json()
+        if not data.get("ok"):
+            logger.warning(f"MT5 bridge /candles_range not ok for {sym} {interval}: "
+                            f"{data.get('reason')}")
+            return [], False
+
+        candles = []
+        bar_secs = _INTERVAL_SECONDS.get(interval, 900)
+        now_utc  = time.time()
+        for c in data.get("candles", []):
+            try:
+                t = int(c["time"]) - tz_offset  # broker-local → true UTC
+                # MT5 has no "complete" flag like OANDA — exclude any bar
+                # whose period hasn't fully elapsed yet, or the cache could
+                # permanently lock in a still-forming bar's not-yet-final
+                # OHLC values (coverage would mark this time as "checked"
+                # and never re-fetch it once the bar actually closes).
+                if t + bar_secs > now_utc:
+                    continue
+                candles.append({
+                    "time":   t,
+                    "open":   round(float(c["open"]),  6),
+                    "high":   round(float(c["high"]),  6),
+                    "low":    round(float(c["low"]),   6),
+                    "close":  round(float(c["close"]), 6),
+                    "volume": int(c.get("volume", 0)),
+                })
+            except (KeyError, TypeError, ValueError) as e:
+                logger.debug(f"MT5 range candle skipped (bad format): {c} — {e}")
+
+        # Bridge answered with ok:true — this range is genuinely confirmed,
+        # whether or not any candles came back (weekend, pre-listing, etc.).
+        return sorted(candles, key=lambda x: x["time"]), True
+
+    except Exception as e:
+        logger.error(f"MT5 bridge unreachable for range fetch ({sym} {interval}): {e} — "
+                      f"treating as UNCONFIRMED, not 'no data'")
+        return [], False
+
+
 def mt5_is_connected() -> bool:
     """
     Quick connectivity check against the MT5 bridge /health endpoint.
@@ -555,17 +680,30 @@ _GRANULARITY_SECONDS = {
 }
 
 
-def oanda_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: int) -> list:
+def oanda_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: int) -> tuple:
     """
     Fetch ALL complete OANDA candles in [start_ts, end_ts] (unix seconds, UTC),
     chunking automatically past the 5000-candle-per-request cap. Returns
     ascending, deduped-by-time. This is a range fetch only — no cache lookup
     here, no fallback chain. Callers wanting cache-awareness should use
     get_historical_candles() below.
+
+    Returns (candles, confirmed) — confirmed is True only if EVERY chunk in
+    [start_ts, end_ts] was successfully checked against OANDA, end to end.
+    A failure partway through (network error, bad response, hitting
+    max_chunks) makes confirmed=False for the WHOLE range, even though some
+    chunks may have succeeded and their candles are still returned/usable.
+    This is intentionally conservative: candle_cache's coverage table only
+    stores a single contiguous [min_ts, max_ts] span per symbol/interval
+    (see its module docstring on interior-gap detection not being
+    implemented), so marking a partially-confirmed range as covered would
+    silently create an interior gap that looks indistinguishable from
+    confirmed-empty. Caller should still cache whatever candles came back —
+    real data is real data — but must not extend coverage on a partial run.
     """
     if not OANDA_API_KEY:
-        logger.warning("oanda_get_candles_range: no OANDA API key — returning empty")
-        return []
+        logger.warning("oanda_get_candles_range: no OANDA API key — returning empty, unconfirmed")
+        return [], False
 
     import requests
 
@@ -581,6 +719,7 @@ def oanda_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: i
     chunk_start = start_ts
     chunks_done = 0
     max_chunks  = 50  # safety cap — prevents a runaway loop on bad input
+    confirmed   = True  # flips to False on any chunk failure or hitting the cap
 
     while chunk_start <= end_ts and chunks_done < max_chunks:
         chunk_end = min(chunk_start + chunk_secs, end_ts)
@@ -603,11 +742,15 @@ def oanda_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: i
             r = requests.get(url, headers=_oanda_headers(), params=params, timeout=15)
             if r.status_code != 200:
                 logger.error(f"OANDA range fetch {r.status_code} for {instrument} "
-                             f"[{from_str} -> {to_str}]: {r.text[:200]}")
+                             f"[{from_str} -> {to_str}]: {r.text[:200]} — "
+                             f"range UNCONFIRMED, will retry on next request")
+                confirmed = False
                 break
             data = r.json()
         except Exception as e:
-            logger.error(f"OANDA range fetch error {instrument}: {e}")
+            logger.error(f"OANDA range fetch error {instrument}: {e} — "
+                          f"range UNCONFIRMED, will retry on next request")
+            confirmed = False
             break
 
         chunk_candles = []
@@ -632,6 +775,8 @@ def oanda_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: i
         if not chunk_candles:
             # Empty window (e.g. before the instrument existed, or a weekend-
             # only span) — advance and keep going rather than treating as fatal.
+            # The request itself succeeded (200, well-formed response), so
+            # this chunk IS confirmed-empty, not a failure.
             chunk_start = chunk_end + bar_secs
             chunks_done += 1
             continue
@@ -642,14 +787,22 @@ def oanda_get_candles_range(symbol: str, interval: str, start_ts: int, end_ts: i
         chunk_start = chunk_candles[-1]["time"] + bar_secs
         chunks_done += 1
 
-    if chunks_done >= max_chunks:
+    if chunks_done >= max_chunks and chunk_start <= end_ts:
         logger.warning(f"OANDA range fetch hit max_chunks={max_chunks} for "
-                        f"{instrument} {interval} — range may be incomplete "
+                        f"{instrument} {interval} — range UNCONFIRMED/incomplete "
                         f"for requested [{start_ts}, {end_ts}]")
+        confirmed = False
 
     # Defensive dedup (PK-style) in case of any edge-case overlap, then sort.
     deduped = {c["time"]: c for c in all_candles}
-    return sorted(deduped.values(), key=lambda x: x["time"])
+    return sorted(deduped.values(), key=lambda x: x["time"]), confirmed
+
+
+_INTERVAL_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "8h": 28800, "12h": 43200,
+    "1d": 86400, "1w": 604800,
+}
 
 
 def get_historical_candles(symbol: str, interval: str, start_ts: int, end_ts: int,
@@ -660,26 +813,93 @@ def get_historical_candles(symbol: str, interval: str, start_ts: int, end_ts: in
     only the missing head/tail of the range is fetched from the live source;
     everything already cached is served from disk.
 
-    Currently OANDA-only for the range-fetch path (it's the deepest, most
-    reliable live history source you have). MT5/yfinance range-fetching can
-    be added the same way later if backtesting needs them too.
+    Supports OANDA and MT5 range-fetching. yfinance/Hyperliquid range-fetch
+    is not implemented — falls back to whatever's already cached.
+
+    cache_key is explicitly namespaced with the source (e.g. "oanda:EUR_USD"
+    vs "mt5:EURUSD") rather than relying on each source's symbol-normalisation
+    happening to produce different strings. OANDA and MT5 report different
+    prices for the same pair (different liquidity pool, different spread) —
+    they must never share cache rows, or repeated requests could silently
+    blend candles from two different brokers into what looks like one
+    continuous series.
     """
     import candle_cache as cc
 
     src = source or ACTIVE_FOREX_SOURCE
-    if src != "oanda":
+
+    if src == "oanda":
+        raw_key     = _oanda_instrument(symbol)
+        granularity = OANDA_GRANULARITY.get(interval, "M15")
+        bar_secs    = _GRANULARITY_SECONDS.get(granularity, 900)
+        range_fetch = lambda gs, ge: oanda_get_candles_range(symbol, interval, gs, ge)
+    elif src == "mt5":
+        raw_key  = symbol.upper().replace("/", "").replace("-", "").replace("_", "").replace("=X", "")
+        bar_secs = _INTERVAL_SECONDS.get(interval, 900)
+        range_fetch = lambda gs, ge: mt5_get_candles_range(symbol, interval, gs, ge)
+    else:
         logger.warning(f"get_historical_candles: range-fetch not yet implemented "
-                        f"for source={src} — only 'oanda' is supported today")
-        return cc.get_cached_range(symbol.upper(), interval, start_ts, end_ts)
+                        f"for source={src} — only 'oanda' and 'mt5' are supported today")
+        return cc.get_cached_range(f"{src}:{symbol.upper()}", interval, start_ts, end_ts)
 
-    cache_key   = _oanda_instrument(symbol)
-    granularity = OANDA_GRANULARITY.get(interval, "M15")
-    bar_secs    = _GRANULARITY_SECONDS.get(granularity, 900)
+    cache_key = f"{src}:{raw_key}"  # namespaced — see docstring
 
+    # Safety margin for the live edge: MT5 (and brokers generally) can have
+    # a real, normal lag between a bar's wall-clock close and that bar
+    # actually being finalised/queryable in history — confirmed empirically
+    # (a periodic reload asked for the tail right up to "now", the broker
+    # legitimately hadn't finalised the last ~2 bars yet, so confirmed=True
+    # came back with nothing for them). Without this margin, extend_coverage
+    # would permanently lock those bars out — coverage doesn't distinguish
+    # "checked too early" from "checked and genuinely empty" once written.
+    # 3 bar-widths (min 5 min) covers normal finalisation lag without
+    # meaningfully slowing real historical backfills, since this only ever
+    # trims the boundary when it's within that margin of true "now" anyway.
+    live_edge_margin = max(bar_secs * 3, 300)
+    safe_now         = int(time.time()) - live_edge_margin
+
+    t0 = time.time()
     gaps = cc.find_missing_ranges(cache_key, interval, start_ts, end_ts, bar_secs)
-    for gap_start, gap_end in gaps:
-        fresh = oanda_get_candles_range(symbol, interval, gap_start, gap_end)
-        if fresh:
-            cc.upsert_candles(cache_key, interval, fresh, source="oanda")
+
+    if not gaps:
+        logger.info(f"candle_cache HIT: {cache_key} {interval} "
+                     f"[{start_ts}, {end_ts}] — served from disk, 0 live calls")
+    else:
+        fetched = 0
+        failed_gaps = 0
+        for gap_start, gap_end in gaps:
+            fresh, confirmed = range_fetch(gap_start, gap_end)
+            if fresh:
+                cc.upsert_candles(cache_key, interval, fresh, source=src)
+                fetched += len(fresh)
+            if confirmed:
+                # Cap the confirmed span short of true "now" by the live-edge
+                # margin above — historical chunks (gap_end already well in
+                # the past) are unaffected since the cap only bites near the
+                # live edge. If the margin would erase the whole gap (a very
+                # recent/narrow tail request), skip extending entirely rather
+                # than write an empty/inverted span.
+                capped_end = min(gap_end, safe_now)
+                if capped_end >= gap_start:
+                    cc.extend_coverage(cache_key, interval, gap_start, capped_end)
+                else:
+                    logger.debug(f"candle_cache: gap [{gap_start}, {gap_end}] for "
+                                 f"{cache_key} {interval} entirely within the live-edge "
+                                 f"margin — confirmed but NOT cached as covered yet, "
+                                 f"will recheck next reload")
+            else:
+                # The fetch itself failed (bridge unreachable, 404 from a
+                # stale deployment, OANDA error, etc.) — do NOT mark this as
+                # checked, or the gap silently disappears and never gets
+                # retried even though no data was ever actually confirmed.
+                failed_gaps += 1
+                logger.error(f"candle_cache: fetch UNCONFIRMED for {cache_key} {interval} "
+                             f"gap [{gap_start}, {gap_end}] — coverage NOT extended, "
+                             f"will retry on next request")
+        elapsed = time.time() - t0
+        logger.info(f"candle_cache MISS: {cache_key} {interval} "
+                     f"[{start_ts}, {end_ts}] — {len(gaps)} gap(s) "
+                     f"({failed_gaps} unconfirmed), {fetched} candles fetched "
+                     f"from {src} in {elapsed:.2f}s")
 
     return cc.get_cached_range(cache_key, interval, start_ts, end_ts)

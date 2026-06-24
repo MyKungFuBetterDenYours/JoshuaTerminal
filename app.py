@@ -17,6 +17,7 @@ from flask import Flask, render_template, jsonify, request, send_from_directory
 from flask_socketio import SocketIO
 from dotenv import load_dotenv
 import data_source as ds
+import candle_cache
 from snapshot_routes import snapshot_bp
 
 # ── Load .env from the project folder (service-safe: does not rely on cwd) ───
@@ -41,6 +42,9 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 app.register_blueprint(snapshot_bp)
 from snapshot_routes import init_app as _snapshot_init
 _snapshot_init(app)   # starts plain-HTTP sidecar for Playwright on a free port
+
+# ── Historical candle cache (SQLite) — backs /api/candles OANDA path + future backtesting
+candle_cache.init_db()
 
 # ─── Disable browser cache for JS/CSS so updates are always picked up ────────
 
@@ -440,9 +444,45 @@ def api_candles():
     if source == "hyperliquid":
         candles = hl_get_candles(symbol, interval, limit)
     elif source == "mt5":
-        candles = ds.mt5_get_candles(symbol, interval, limit)
+        if ds.mt5_is_connected():
+            # Cache-aware path: no artificial count cap (unlike the old
+            # pos-based bridge route, which silently truncated anything
+            # above 5000) — copy_rates_range has no such limit.
+            bar_secs = ds._INTERVAL_SECONDS.get(interval, 900)
+            end_ts   = int(time.time())
+            start_ts = end_ts - bar_secs * limit
+            candles = ds.get_historical_candles(symbol, interval, start_ts, end_ts, source="mt5")
+            # Cache only holds confirmed-complete bars — append the live
+            # forming bar separately, same reasoning as the OANDA path below.
+            if candles:
+                live_bar = ds.mt5_get_live_bar(symbol, interval, candles[-1]["time"])
+                if live_bar:
+                    candles.append(live_bar)
+        else:
+            # Bridge unreachable — fall back to the legacy path, which has
+            # its own OANDA → yfinance fallback chain built in.
+            candles = ds.mt5_get_candles(symbol, interval, limit)
     elif source == "oanda":
-        candles = ds.oanda_get_candles(symbol, interval, limit)
+        if ds.OANDA_API_KEY:
+            # Cache-aware path: computes a [start_ts, end_ts] window covering
+            # `limit` bars and only fetches whatever isn't already cached.
+            # Same shared primitive the future backtesting engine will use.
+            granularity = ds.OANDA_GRANULARITY.get(interval, "M15")
+            bar_secs    = ds._GRANULARITY_SECONDS.get(granularity, 900)
+            end_ts      = int(time.time())
+            start_ts    = end_ts - bar_secs * limit
+            candles = ds.get_historical_candles(symbol, interval, start_ts, end_ts, source="oanda")
+            # Cache only ever holds complete bars (correct for backtesting) —
+            # append the currently-forming bar separately so pane.js has a
+            # live anchor for onPriceUpdate() to merge ticks into. Without
+            # this, live ticks would overwrite the last *closed* candle.
+            if candles:
+                live_bar = ds.oanda_get_live_bar(symbol, interval, candles[-1]["time"])
+                if live_bar:
+                    candles.append(live_bar)
+        else:
+            # No OANDA key configured — same fallback the old oanda_get_candles() did
+            candles = ds.yfinance_get_candles(symbol, interval, limit)
     elif source == "yfinance":
         candles = ds.yfinance_get_candles(symbol, interval, limit)
     else:
