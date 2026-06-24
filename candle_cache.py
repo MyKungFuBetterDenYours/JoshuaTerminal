@@ -78,6 +78,21 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_candles_lookup
             ON candles (symbol, interval, time)
         """)
+        # Tracks what's been CONFIRMED against the live source — independent
+        # of whether that confirmation found any candles. Without this,
+        # legitimately-empty spans (weekends, holidays, pre-listing history)
+        # look identical to "never checked" and get re-fetched on every
+        # single request, forever. One row per (symbol, interval): the
+        # continuous [min_ts, max_ts] span known to be fully checked.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS coverage (
+                symbol   TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                min_ts   INTEGER NOT NULL,
+                max_ts   INTEGER NOT NULL,
+                PRIMARY KEY (symbol, interval)
+            )
+        """)
         conn.commit()
     logger.info(f"candle_cache: DB ready at {DB_PATH}")
 
@@ -126,23 +141,62 @@ def upsert_candles(symbol: str, interval: str, candles: list, source: str):
         conn.commit()
 
 
+def get_coverage(symbol: str, interval: str):
+    """Return (min_ts, max_ts) of the confirmed-checked span, or (None, None)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT min_ts, max_ts FROM coverage WHERE symbol=? AND interval=?",
+            (symbol, interval),
+        ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def extend_coverage(symbol: str, interval: str, range_start: int, range_end: int):
+    """
+    Record that [range_start, range_end] has been checked against the live
+    source — regardless of whether any candles were actually found in it.
+    Assumes coverage grows contiguously outward from the existing span (true
+    for how get_historical_candles calls this — it always extends from the
+    current cached edge). Does not itself detect interior gaps; see the
+    module-level note on that limitation.
+    """
+    cur_min, cur_max = get_coverage(symbol, interval)
+    if cur_min is None:
+        new_min, new_max = range_start, range_end
+    else:
+        new_min, new_max = min(cur_min, range_start), max(cur_max, range_end)
+
+    with _lock, _connect() as conn:
+        conn.execute(
+            """INSERT INTO coverage (symbol, interval, min_ts, max_ts)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(symbol, interval) DO UPDATE SET
+                   min_ts = excluded.min_ts,
+                   max_ts = excluded.max_ts""",
+            (symbol, interval, new_min, new_max),
+        )
+        conn.commit()
+
+
 def find_missing_ranges(symbol: str, interval: str, start_ts: int, end_ts: int,
                          bar_seconds: int) -> list:
     """
-    Diff the requested [start_ts, end_ts] against what's cached.
-    Returns [(gap_start, gap_end), ...] — only head/tail gaps (see module
-    docstring re: interior gap detection not yet implemented).
+    Diff the requested [start_ts, end_ts] against confirmed coverage (NOT
+    raw candle rows — a span can be fully checked and legitimately empty,
+    e.g. a weekend). Returns [(gap_start, gap_end), ...] for the head/tail
+    portions outside the known-covered span. See module docstring re:
+    interior gap detection not yet implemented.
     """
-    cached_min, cached_max = get_cached_bounds(symbol, interval)
+    cov_min, cov_max = get_coverage(symbol, interval)
 
-    if cached_min is None:
+    if cov_min is None:
         return [(start_ts, end_ts)]
 
     gaps = []
-    if start_ts < cached_min:
-        gaps.append((start_ts, cached_min - bar_seconds))
-    if end_ts > cached_max:
-        gaps.append((cached_max + bar_seconds, end_ts))
+    if start_ts < cov_min:
+        gaps.append((start_ts, cov_min - 1))
+    if end_ts > cov_max:
+        gaps.append((cov_max + 1, end_ts))
     return gaps
 
 

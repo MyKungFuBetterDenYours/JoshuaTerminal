@@ -110,6 +110,18 @@ _tick_cache: dict  = {}   # symbol → {bid, ask, mid, time}
 _subscribed: set   = set()  # symbols currently being polled
 _cache_lock        = threading.Lock()
 
+# The MetaTrader5 Python package is NOT thread-safe — concurrent calls into
+# its IPC layer from multiple threads (Flask's threaded=True request threads,
+# plus the background tick poller below) can silently return empty/wrong
+# results without raising an exception or setting a useful last_error().
+# This is exactly the failure mode that caused /candles_range to return
+# ok:true with 0 candles for a range later confirmed (via an isolated,
+# single-threaded script) to have 7120 real bars — every direct mt5.* call
+# in this file must go through this lock. RLock (not Lock) because
+# _ensure_connected() acquires it and is itself called from inside other
+# locked blocks — a plain Lock would deadlock on that same-thread reentry.
+_mt5_lock          = threading.RLock()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMEFRAME MAP  —  JT interval strings → MT5 TIMEFRAME constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,9 +156,10 @@ def _ensure_connected() -> tuple[bool, str]:
         kwargs = {}
         if MT5_PROGRAM:
             kwargs["program"] = MT5_PROGRAM
-        if not mt5.initialize(**kwargs):
-            code, msg = mt5.last_error()
-            return False, f"MT5 initialize failed — code {code}: {msg}"
+        with _mt5_lock:
+            if not mt5.initialize(**kwargs):
+                code, msg = mt5.last_error()
+                return False, f"MT5 initialize failed — code {code}: {msg}"
         return True, "ok"
     except Exception as e:
         return False, str(e)
@@ -216,12 +229,13 @@ def _tick_poller():
         updates = {}
         for sym in symbols:
             try:
-                tick = mt5.symbol_info_tick(sym)
-                if not tick:
-                    # Symbol not yet in Market Watch — select it and retry.
-                    # This is safe to do in the poller thread (blocking is fine here).
-                    mt5.symbol_select(sym, True)
+                with _mt5_lock:
                     tick = mt5.symbol_info_tick(sym)
+                    if not tick:
+                        # Symbol not yet in Market Watch — select it and retry.
+                        # This is safe to do in the poller thread (blocking is fine here).
+                        mt5.symbol_select(sym, True)
+                        tick = mt5.symbol_info_tick(sym)
                 if tick:
                     updates[sym] = _tick_to_dict(sym, tick)
             except Exception as e:
@@ -262,8 +276,9 @@ def health():
         return jsonify({"ok": False, "mt5": False, "reason": msg}), 503
 
     try:
-        info    = mt5.terminal_info()
-        version = mt5.version()
+        with _mt5_lock:
+            info    = mt5.terminal_info()
+            version = mt5.version()
         return jsonify({
             "ok":        True,
             "mt5":       True,
@@ -274,6 +289,54 @@ def health():
         })
     except Exception as e:
         return jsonify({"ok": False, "mt5": False, "reason": str(e)}), 500
+
+
+# Cached broker UTC offset — computed once, reused by /timezone (output
+# correction reference) and candles_range() (input correction, see below).
+# Guarded by _mt5_lock since the underlying probe touches mt5.* calls.
+_broker_offset_cache: int = None  # None = not yet computed
+
+
+def _get_broker_offset() -> int:
+    """
+    Return the broker's UTC offset in seconds (positive = broker ahead of
+    UTC, e.g. +10800 for UTC+3), computed once and cached for the process
+    lifetime. Same tick-comparison strategy as the /timezone route — pulled
+    out here so candles_range() can reuse it without going through HTTP.
+    """
+    global _broker_offset_cache
+    with _mt5_lock:
+        if _broker_offset_cache is not None:
+            return _broker_offset_cache
+
+        probe_symbols = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF"]
+        tick = None
+        for sym in probe_symbols:
+            try:
+                mt5.symbol_select(sym, True)
+                t = mt5.symbol_info_tick(sym)
+                if t and t.time > 0:
+                    tick = t
+                    break
+            except Exception:
+                continue
+
+        if not tick:
+            try:
+                info = mt5.terminal_info()
+                if info and hasattr(info, 'server_time_offset'):
+                    _broker_offset_cache = int(info.server_time_offset)
+                    return _broker_offset_cache
+            except Exception:
+                pass
+            _broker_offset_cache = 0
+            return 0
+
+        utc_now_sec = int(datetime.now(timezone.utc).timestamp())
+        broker_sec  = int(tick.time)
+        raw_offset  = broker_sec - utc_now_sec
+        _broker_offset_cache = round(raw_offset / 900) * 900  # snap to 15-min boundary
+        return _broker_offset_cache
 
 
 @app.route("/timezone", methods=["GET"])
@@ -302,56 +365,12 @@ def timezone_offset():
     if not ok:
         return jsonify({"ok": False, "reason": msg}), 503
 
-    # Try a handful of liquid symbols until we get a valid tick
-    probe_symbols = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF"]
-    tick = None
-    for sym in probe_symbols:
-        try:
-            mt5.symbol_select(sym, True)
-            t = mt5.symbol_info_tick(sym)
-            if t and t.time > 0:
-                tick = t
-                break
-        except Exception:
-            continue
-
-    if not tick:
-        # Market may be closed — fall back to terminal_info which exposes
-        # the server UTC offset directly (available even when market is closed)
-        try:
-            info = mt5.terminal_info()
-            if info and hasattr(info, 'server_time_offset'):
-                offset = int(info.server_time_offset)
-                return jsonify({
-                    "ok":             True,
-                    "offset_seconds": offset,
-                    "offset_hours":   round(offset / 3600, 2),
-                    "source":         "terminal_info",
-                })
-        except Exception:
-            pass
-        return jsonify({
-            "ok":             True,
-            "offset_seconds": 0,
-            "offset_hours":   0.0,
-            "source":         "fallback_zero",
-            "warning":        "Could not probe broker time — no tick data available. "
-                              "Candle timestamps may be offset from UTC.",
-        })
-
-    # Compute offset: broker_tick_time - utc_now
-    utc_now_sec  = int(datetime.now(timezone.utc).timestamp())
-    broker_sec   = int(tick.time)
-    # Round to nearest 15 minutes to ignore network latency jitter
-    raw_offset   = broker_sec - utc_now_sec
-    offset_sec   = round(raw_offset / 900) * 900   # snap to nearest 15-min boundary
-
+    offset = _get_broker_offset()
     return jsonify({
         "ok":             True,
-        "offset_seconds": offset_sec,
-        "offset_hours":   round(offset_sec / 3600, 2),
-        "source":         "tick_comparison",
-        "raw_offset":     raw_offset,
+        "offset_seconds": offset,
+        "offset_hours":   round(offset / 3600, 2),
+        "source":         "tick_comparison" if offset != 0 else "fallback_zero",
     })
 
 @app.route("/price", methods=["GET"])
@@ -399,13 +418,14 @@ def price():
     # Select it in Market Watch and retry up to 3 times with a short delay —
     # MT5 needs a moment to receive the first tick from the broker after selection.
     try:
-        mt5.symbol_select(symbol, True)
-        tick = None
-        for _ in range(3):
-            tick = mt5.symbol_info_tick(symbol)
-            if tick:
-                break
-            time.sleep(0.3)
+        with _mt5_lock:
+            mt5.symbol_select(symbol, True)
+            tick = None
+            for _ in range(3):
+                tick = mt5.symbol_info_tick(symbol)
+                if tick:
+                    break
+                time.sleep(0.3)
     except Exception as e:
         return jsonify({"ok": False, "reason": str(e)}), 500
 
@@ -489,11 +509,12 @@ def candles():
     timeframe = _resolve_timeframe(interval)
 
     try:
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, limit)
-        if rates is None or len(rates) == 0:
-            # Symbol may not be in Market Watch yet — select and retry once
-            mt5.symbol_select(symbol, True)
+        with _mt5_lock:
             rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, limit)
+            if rates is None or len(rates) == 0:
+                # Symbol may not be in Market Watch yet — select and retry once
+                mt5.symbol_select(symbol, True)
+                rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, limit)
     except Exception as e:
         return jsonify({"ok": False, "reason": str(e)}), 500
 
@@ -510,6 +531,132 @@ def candles():
     # MT5 returns a numpy structured array — convert to plain dicts.
     # time field is already a unix timestamp (seconds, UTC).
     # Sort oldest-first for Lightweight Charts compatibility.
+    result = sorted(
+        [
+            {
+                "time":   int(r["time"]),
+                "open":   round(float(r["open"]),  6),
+                "high":   round(float(r["high"]),  6),
+                "low":    round(float(r["low"]),   6),
+                "close":  round(float(r["close"]), 6),
+                "volume": int(r["tick_volume"]),
+            }
+            for r in rates
+        ],
+        key=lambda c: c["time"],
+    )
+
+    return jsonify({
+        "ok":       True,
+        "symbol":   symbol,
+        "interval": interval,
+        "candles":  result,
+    })
+
+
+@app.route("/candles_range", methods=["GET"])
+def candles_range():
+    """
+    Return OHLCV candle history for a symbol within a specific date range.
+    This is the MT5 equivalent of OANDA's chunked range fetch — used by
+    Joshua Terminal's historical data cache and the future backtesting
+    engine, which need an arbitrary historical window rather than just
+    "the last N bars" (that's what /candles already does via
+    copy_rates_from_pos).
+
+    Query params:
+        symbol    — e.g. EURUSD, EUR/USD                       (required)
+        interval  — 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 1w      (default: 1h)
+        from_ts   — range start, unix seconds, UTC              (required)
+        to_ts     — range end,   unix seconds, UTC              (required)
+
+    NOTE on timezones: from_ts/to_ts arrive here as true UTC. CONFIRMED (not
+    just suspected) that MT5's copy_rates_range() interprets the date_from/
+    date_to args as BROKER-LOCAL time regardless of their UTC tzinfo — this
+    was caught by comparing copy_rates_range()'s newest available bar against
+    copy_rates_from_pos()'s newest bar at the same instant: they differed by
+    exactly the broker's UTC offset, meaning every deep-history fetch was
+    silently missing the most recent span equal to that offset. This route
+    now shifts from_ts/to_ts forward by the broker offset (via
+    _get_broker_offset()) before constructing date_from/date_to, so MT5's
+    broker-local reading lands on the true-UTC instant actually requested.
+    The candle "time" values in the response remain in BROKER SERVER TIME
+    (unchanged by the above) — callers must still apply the same
+    /timezone-derived offset correction they already use for /candles to
+    normalise the OUTPUT to UTC. Input and output need separate, opposite-
+    direction corrections; don't conflate them when touching this code.
+
+    Unlike /candles, there is no artificial count cap here — you get
+    whatever the local MT5 terminal has cached for this range. If the
+    terminal has never had this symbol/timeframe scrolled back that far,
+    MT5 may return fewer bars than the range implies, or an empty list
+    (which is a valid, non-error result — e.g. a weekend with no trading).
+
+    Response:
+        { "ok": true, "symbol": "EURUSD", "interval": "1h", "candles": [...] }
+
+    Example:
+        curl "http://192.168.1.50:5006/candles_range?symbol=EURUSD&interval=1h&from_ts=1717000000&to_ts=1717100000"
+    """
+    raw      = request.args.get("symbol",   "").strip()
+    interval = request.args.get("interval", "1h").strip()
+    symbol   = _normalize_symbol(raw)
+
+    try:
+        from_ts = int(request.args.get("from_ts", ""))
+        to_ts   = int(request.args.get("to_ts", ""))
+    except (TypeError, ValueError):
+        return jsonify({
+            "ok": False, "reason": "from_ts and to_ts are required and must be integer unix seconds",
+        }), 400
+
+    if not symbol:
+        return jsonify({"ok": False, "reason": "symbol param is required"}), 400
+    if interval not in _TIMEFRAME_MAP:
+        return jsonify({
+            "ok":     False,
+            "reason": f"Unknown interval '{interval}'. "
+                      f"Valid values: {', '.join(_TIMEFRAME_MAP)}",
+        }), 400
+    if to_ts <= from_ts:
+        return jsonify({"ok": False, "reason": "to_ts must be greater than from_ts"}), 400
+
+    ok, msg = _ensure_connected()
+    if not ok:
+        return jsonify({"ok": False, "reason": msg}), 503
+
+    timeframe = _resolve_timeframe(interval)
+
+    # MT5's copy_rates_range() interprets date_from/date_to as BROKER-LOCAL
+    # time, not true UTC, even though we pass timezone-aware UTC datetime
+    # objects (confirmed empirically: its returned upper bound consistently
+    # lagged copy_rates_from_pos()'s by exactly the broker's UTC offset —
+    # i.e. the most recent ~3h of genuinely-complete bars were silently
+    # missing from every deep-history fetch). Shift the requested boundary
+    # forward by the broker offset so MT5's broker-local reading lands on
+    # the true-UTC instant we actually want. The candle data returned below
+    # is UNCHANGED by this — it's still raw broker-local "time" values,
+    # corrected back to true UTC client-side in data_source.py exactly as
+    # before. Only the query boundary needs this adjustment.
+    offset    = _get_broker_offset()
+    date_from = datetime.fromtimestamp(from_ts + offset, tz=timezone.utc)
+    date_to   = datetime.fromtimestamp(to_ts   + offset, tz=timezone.utc)
+
+    try:
+        with _mt5_lock:
+            rates = mt5.copy_rates_range(symbol, timeframe, date_from, date_to)
+            if rates is None or len(rates) == 0:
+                # Symbol may not be in Market Watch yet — select and retry once.
+                # An empty result after this retry is treated as legitimate
+                # (e.g. weekend, or pre-listing history) rather than an error.
+                mt5.symbol_select(symbol, True)
+                rates = mt5.copy_rates_range(symbol, timeframe, date_from, date_to)
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+
+    if rates is None:
+        rates = []
+
     result = sorted(
         [
             {
@@ -562,7 +709,8 @@ def symbols():
     q = request.args.get("q", "").upper().strip()
 
     try:
-        all_symbols = mt5.symbols_get()
+        with _mt5_lock:
+            all_symbols = mt5.symbols_get()
     except Exception as e:
         return jsonify({"ok": False, "reason": str(e)}), 500
 

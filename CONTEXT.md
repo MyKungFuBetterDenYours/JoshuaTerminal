@@ -122,30 +122,31 @@ The `<select class="pane-source-select">` element has been removed from `_buildH
 
 ## Bar Advance — Timezone-Safe Implementation (CRITICAL)
 
-### Problem
+### Problem (original, since resolved differently — see below)
 MT5 bridge returns candle timestamps in **broker server time** (commonly UTC+2 or UTC+3), not UTC. The old bar-advance logic compared `last.time` (broker epoch) against `Date.now()/1000` (UTC epoch) — the difference of 2–3 hours made `nowSec >= barEndSec` always false, so the same candle updated forever and new candles never advanced.
 
-### Fix — elapsed wall-clock time
-`_renderCandles()` records two anchors when candles are loaded:
+### Current fix — direct UTC timestamp comparison (supersedes the elapsed-wall-clock approach below)
+The actual fix ended up being upstream of the frontend, not in it: `data_source.py` corrects MT5's broker-local candle `time` values to true UTC (via the `/timezone`-derived offset) **before** they ever reach `pane.js`. Once both sides of the comparison are genuinely UTC, the obvious direct comparison just works and has no hidden dependency on page-load timing:
+```javascript
+const newBarDetected = barDurSec > 0 && nowSec >= last.time + barDurSec;
+```
+This is what the current code does. The elapsed-wall-clock approach documented below was an earlier attempt that worked around the symptom (comparing across mismatched time domains) without fixing the actual cause (uncorrected broker-local timestamps) — kept here for historical context, but don't reintroduce it; it has its own failure mode (breaks if the tab is paused/backgrounded across a bar boundary, since `_candlesLoadedAt`-relative elapsed time doesn't account for time the JS event loop wasn't running).
+
+<details><summary>Superseded approach (kept for context, do not follow)</summary>
+
+`_renderCandles()` recorded two anchors when candles were loaded:
 ```javascript
 this._candlesLoadedAt   = Date.now();   // wall-clock ms (always UTC)
 this._lastBarTimeAtLoad = last.time;    // broker-time domain — used for new bar timestamps
 ```
 
-`onPriceUpdate()` uses elapsed real time, not candle timestamps vs `Date.now()`:
+`onPriceUpdate()` used elapsed real time, not candle timestamps vs `Date.now()`:
 ```javascript
 const elapsedSec  = (Date.now() - this._candlesLoadedAt) / 1000;
 const barsElapsed = Math.floor(elapsedSec / barDurSec);
-// new bar time stays in broker-time domain (monotonically increasing for LWC)
 const newBarTime  = this._lastBarTimeAtLoad + barsElapsed * barDurSec;
 ```
-
-`_startCandleCountdown()` uses the same elapsed-time approach — also timezone-agnostic.
-
-### Why this works for all sources
-- OANDA/YF return UTC timestamps — elapsed math gives the same result as the old comparison
-- MT5 returns broker-time timestamps — elapsed math is timezone-agnostic, works correctly
-- The candle series timestamps stay in whatever domain the source uses (monotonically increasing = valid for LWC)
+</details>
 
 ### Race condition fix
 `this.candles = []` is set at the **top** of `_loadData()`, before the async fetch. This prevents `onPriceUpdate()` from mutating stale candle state during the network round-trip when source or interval changes. `onPriceUpdate()` guards with `if (this.candles.length > 0)` so ticks during load are safely ignored.
@@ -463,6 +464,37 @@ curl "http://192.168.1.20:5006/candles?symbol=EURUSD&interval=5m&limit=5"  # can
 Confirmed working (heartbeats visible on all panes, both MT5 and OANDA). Halting feature work pending multi-day stability confirmation.
 
 ---
+
+## Session Notes — 2026-06-24 (Historical Cache: Three Stacked Bugs)
+
+### Problem
+After wiring `candle_cache.py` + `/candles_range` for deep history backfill (10000-candle dropdown tier), charts loaded blank, then loaded with a multi-hour gap near the live edge, then a smaller-but-still-wrong gap. Three independent bugs were found and fixed in sequence — each one masked the next until fixed individually.
+
+### Root causes found (in order of discovery)
+
+#### 1. Stale bridge deployment, masked by a coverage-tracking gap (CRITICAL)
+The Windows machine's `mt5_bridge.py` (run from `MyTrade`, its permanent/intended location — not stale by folder, just an outdated *copy* of the file) predated the `/candles_range` route, causing every deep-history request to 404. Compounding this: `get_historical_candles()` was calling `cc.extend_coverage()` even when the fetch itself failed (404/unreachable), permanently marking the failed range as "checked empty" and masking the real cause. **Fix:** `mt5_get_candles_range()` / `oanda_get_candles_range()` now return `(candles, confirmed)` tuples — `confirmed=False` on any fetch failure — and coverage is only extended when `confirmed=True`. **Diagnostic note:** a 404 from Flask (Werkzeug's generic HTML error page, not bridge JSON) means the route doesn't exist on whatever process is actually bound to the port — check the file on disk (`findstr /n "candles_range" mt5_bridge.py`) and whether the *running* process actually matches it (stale process never restarted after a file update is the usual cause, not a missing route).
+
+#### 2. MetaTrader5 Python package is not thread-safe (CRITICAL)
+With the bridge fixed, deep-history fetches still silently returned `ok:true, 0 candles` under concurrent load (multiple panes requesting `10000` at once) — but an isolated single-threaded diagnostic script calling the identical `copy_rates_range()` params reliably returned real data (7120 bars). The difference: Flask's `threaded=True` plus the 250ms background tick-poller thread were making concurrent, unsynchronized calls into MT5's IPC layer. **Fix:** added a global `_mt5_lock = threading.RLock()` in `mt5_bridge.py`, wrapping every direct `mt5.*` call (in `_ensure_connected()`, the tick poller, `/health`, `/timezone`, `/price`, `/candles`, `/candles_range`, `/symbols`). RLock (not plain `Lock`) because `_ensure_connected()` acquires it and is itself called from inside other already-locked sections. **Tradeoff:** `/price`'s cold-start retry loop now holds the lock through `time.sleep(0.3)` × up to 3 — blocks other MT5 calls for up to ~0.9s on a symbol's first request only.
+
+#### 3. copy_rates_range() interprets date_from/date_to as broker-local, not UTC (CRITICAL — confirmed, not theoretical)
+Even with the lock fix, deep fetches were consistently missing exactly the most recent ~3 hours (= the broker's UTC offset) of otherwise-real data. Confirmed empirically: `copy_rates_range()`'s newest available bar and `copy_rates_from_pos()`'s newest bar (same instant, same script run) differed by exactly 10800s. MT5 silently treats the tz-aware UTC `datetime` objects passed to `copy_rates_range()` as if they were broker-local — `copy_rates_from_pos()` is immune since it takes no date range at all (position-based only), which is why `/candles` always worked while only `/candles_range` was affected. **Fix:** `candles_range()` now shifts `from_ts`/`to_ts` forward by the broker offset (via new `_get_broker_offset()` helper, factored out of `/timezone` and cached) before constructing `date_from`/`date_to`. The candle *output* timestamps are unaffected — still broker-local, still corrected back to UTC client-side in `data_source.py` exactly as before. **Input and output corrections go in opposite directions — do not conflate them.**
+
+#### 4. Coverage extended past true "now", locking out not-yet-finalised bars (related, found after #3)
+With all three above fixed, a smaller (~1-2 bar) gap kept reappearing right behind the live edge on every periodic reload. Cause: a reload's tail-gap request legitimately got `confirmed=True, 0 candles` back because MT5 hadn't finished finalising the last bar or two yet (normal settling lag, not a bug) — but `extend_coverage()` then marked the *entire* requested span (including the not-yet-finalised portion) as permanently checked, per the same interior-gap blind spot already flagged in `candle_cache.py`'s module docstring. Once written, those bars could never be re-checked even after MT5 finished finalising them. **Fix:** `get_historical_candles()` now caps coverage extension at `now - live_edge_margin` (3 bar-widths, min 5 min) — historical backfills are unaffected (the cap only bites when a gap's end is already within that margin of true now); the live tail simply stays open to re-checking each reload until it ages past the margin.
+
+### Diagnostic approach
+Standalone script (`mt5_range_diag.py`) calling `copy_rates_range()` / `copy_rates_from_pos()` directly via the MetaTrader5 package, bypassing the bridge's HTTP layer entirely — used to isolate "is this MT5's behavior or a bug in our wrapping of it" at two separate points (the thread-safety bug and the UTC-interpretation bug). Cross-referencing `coverage` vs `candles` table contents directly via sqlite (`SELECT MAX(time) ...` vs `SELECT * FROM coverage ...`) was what surfaced bugs #3 and #4 — screenshots/visual chart inspection were unreliable for spotting gaps under ~1 hour and actively misleading once NY/UTC display timezones were in play (MT5 GUI is UTC, JT is NY — apparent "different candle shapes" between them was a viewport/zoom difference, not a data bug, on first inspection).
+
+### Files changed
+- `mt5_bridge.py` — `_mt5_lock` (RLock) around all `mt5.*` calls; `_get_broker_offset()` extracted/cached helper; `candles_range()` input-side offset shift
+- `data_source.py` — `mt5_get_candles_range()` / `oanda_get_candles_range()` return `(candles, confirmed)`; `get_historical_candles()` only extends coverage on `confirmed=True`, capped by `live_edge_margin`
+
+### Status
+Confirmed stable over multiple consecutive checks: `coverage`'s max_ts advances in step with real elapsed time (one bar per bar-width of wall time), settling at ~1-1.5 bars behind "now" and holding steady rather than drifting. Cache cleanup required after each of bugs #1 and #3 (`DELETE FROM coverage WHERE symbol LIKE 'mt5:%'` — stale coverage written by the broken code doesn't self-heal).
+
+---
 ## Bucket List (future sessions)
 - [ ] **Timezone timescale fix** — after `applyTimezone()` changes `tickMarkFormatter`, force a timescale redraw so axis labels update immediately without requiring a scroll/reload
 - [ ] **Web search in analysis** — add `web_search` tool to `client.messages.create()` in `run_analysis.py`
@@ -510,8 +542,22 @@ Point JT at whichever port via `MT5_BRIDGE_PORT` in `.env`.
 ### api_candles must route by source= param directly (CRITICAL)
 `ds.get_candles()` uses the server-side `ACTIVE_FOREX_SOURCE` global — it ignores the `source=` query param. **Always** call `ds.mt5_get_candles()` / `ds.oanda_get_candles()` / `ds.yfinance_get_candles()` directly in the route, never `ds.get_candles()`. The old code caused all panes to receive candles from the same source regardless of what was requested.
 
-### Bar advance must use elapsed time, not candle timestamps (CRITICAL)
-MT5 broker timestamps are not UTC. Never compute bar boundaries as `last.time + intervalSec >= Date.now()/1000` — this comparison is between different time domains. Use `(Date.now() - _candlesLoadedAt) / 1000` (elapsed wall-clock seconds) to determine when the next bar starts.
+### Bar advance must use direct UTC timestamp comparison (CRITICAL — supersedes earlier note below)
+`nowSec >= last.time + barDurSec`, comparing real elapsed UTC time against the bar's own timestamp. **Do not use "elapsed wall-clock time since page load" (`(Date.now() - _candlesLoadedAt) / 1000`)** — that was an earlier, since-superseded approach (see old note directly below, kept for history) that breaks if the tab is left open across a page-visibility pause/sleep, since `_candlesLoadedAt` doesn't account for time the JS event loop wasn't running. Direct timestamp comparison has no such dependency.
+
+<details><summary>Superseded note (kept for context, do not follow)</summary>
+
+~~MT5 broker timestamps are not UTC. Never compute bar boundaries as `last.time + intervalSec >= Date.now()/1000`... Use elapsed wall-clock seconds instead.~~ — candle `time` values are corrected to true UTC server-side before reaching the frontend (see MT5 broker timestamp correction elsewhere in this doc), so comparing them directly against `Date.now()/1000` (also true UTC) is correct and is what the current code does. The elapsed-wall-clock-time approach this note originally recommended has been replaced.
+</details>
+
+### MetaTrader5 Python package is not thread-safe (CRITICAL)
+Concurrent calls into `mt5.*` from multiple threads — Flask's `threaded=True` request threads racing against the 250ms tick-poller thread — can silently return empty/wrong results with no exception and a misleadingly normal `last_error()`. Symptom looked exactly like "no data for this range" but was actually a race. Fix: single global `threading.RLock()` in `mt5_bridge.py` wrapping every direct `mt5.*` call site, no exceptions. Use RLock, not Lock — `_ensure_connected()` acquires it and is called from inside other already-locked sections.
+
+### copy_rates_range() reads date_from/date_to as broker-local time, not UTC (CRITICAL)
+Confirmed empirically (not just suspected): passing tz-aware UTC `datetime` objects doesn't stop MT5 from treating them as broker-local internally — the function's returned upper bound consistently lagged `copy_rates_from_pos()`'s by exactly the broker's UTC offset. `copy_rates_from_pos()` (position-based, no date range) is unaffected, which is why `/candles` always worked while `/candles_range` silently truncated the most recent span. Fix: shift `from_ts`/`to_ts` forward by the broker offset before building the datetime objects passed into `copy_rates_range()`. The *output* candle timestamps still need the existing opposite-direction (broker-local → UTC) correction — these are two separate, opposite-direction corrections; don't conflate them.
+
+### Coverage must never extend all the way to "now" (live-edge margin)
+A periodic reload's tail-gap fetch can legitimately get `confirmed=True` with 0 candles simply because MT5 hasn't finalised the last bar or two yet (normal settling lag). If `extend_coverage()` is allowed to mark that entire span as checked, those bars are permanently locked out of the cache even once MT5 finishes finalising them — `candle_cache.py`'s coverage table has no interior-gap detection, so "checked too early" and "checked and genuinely empty" become indistinguishable once written. `get_historical_candles()` caps coverage extension at `now - live_edge_margin` (3 bar-widths, min 5 min) so the live tail always stays open to re-checking until it ages past that margin.
 
 ### Per-pane source was removed — don't re-introduce it
 The `pane-source-select` dropdown has been deliberately removed. All source decisions go through `globalSource` (app.js) or symbol auto-detection (`_changeSymbol` in pane.js). Do not re-add per-pane source without rethinking the entire subscription routing.

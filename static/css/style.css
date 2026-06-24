@@ -234,7 +234,8 @@ html, body {
 
 .pane-source-select,
 .pane-symbol-input,
-.pane-interval-select {
+.pane-interval-select,
+.pane-limit-select {
   background: var(--bg4);
   border: 1px solid var(--border);
   color: var(--text);
@@ -247,11 +248,13 @@ html, body {
 }
 .pane-source-select:focus,
 .pane-symbol-input:focus,
-.pane-interval-select:focus { border-color: var(--accent2); }
+.pane-interval-select:focus,
+.pane-limit-select:focus { border-color: var(--accent2); }
 
 .pane-source-select { width: 130px; }
 .pane-symbol-input  { width: 90px; text-transform: uppercase; }
 .pane-interval-select { width: 62px; }
+.pane-limit-select { width: 60px; }
 
 .pane-toolbar-spacer { flex: 1; }
 

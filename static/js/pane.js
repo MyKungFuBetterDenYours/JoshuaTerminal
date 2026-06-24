@@ -6,6 +6,12 @@
 
 const INTERVALS = ["1m","3m","5m","15m","30m","1h","2h","4h","8h","12h","1d","1w"];
 
+// How many candles to request per pane. Backed by the SQLite candle cache
+// (see candle_cache.py / get_historical_candles) — values past 5000 trigger
+// OANDA's chunked range-fetch path rather than a single request.
+const CANDLE_LIMITS = [200, 400, 1000, 2500, 5000, 10000];
+const DEFAULT_CANDLE_LIMIT = 400;
+
 const INDICATOR_DEFS = [
   { group: "Moving Averages", items: [
     { id:"sma20",  label:"SMA (20)",    color:"#2196f3", type:"overlay" },
@@ -65,6 +71,7 @@ class ChartPane {
     this.source   = config.source   || 'oanda';
     this.symbol   = (config.symbol  || 'EURUSD=X').toUpperCase();
     this.interval = config.interval || '15m';
+    this.candleLimit = this._loadCandleLimit();
 
     this.candles          = [];
     this.activeIndicators = new Set();
@@ -174,6 +181,9 @@ class ChartPane {
         </div>
         <select class="pane-interval-select">
           ${INTERVALS.map(i=>`<option value="${i}"${i===this.interval?' selected':''}>${i}</option>`).join('')}
+        </select>
+        <select class="pane-limit-select" title="Candles to load">
+          ${CANDLE_LIMITS.map(n=>`<option value="${n}"${n===this.candleLimit?' selected':''}>${n}</option>`).join('')}
         </select>
         <div class="pane-toolbar-spacer"></div>
         <button class="btn-save-state" title="Save chart state for ${this.symbol}" style="display:none">
@@ -303,9 +313,20 @@ class ChartPane {
   _attachEvents() {
     const symbolEl   = this.container.querySelector('.pane-symbol-input');
     const intervalEl = this.container.querySelector('.pane-interval-select');
+    const limitEl    = this.container.querySelector('.pane-limit-select');
 
     intervalEl.addEventListener('change', () => {
       this.interval = intervalEl.value;
+      // candleLimit is persisted per symbol+interval (same granularity as
+      // barSpacing) — pick up whatever was last chosen for this new interval.
+      this.candleLimit = this._loadCandleLimit();
+      limitEl.value = this.candleLimit;
+      this._loadData();
+    });
+
+    limitEl.addEventListener('change', () => {
+      this.candleLimit = parseInt(limitEl.value, 10) || DEFAULT_CANDLE_LIMIT;
+      this._saveCandleLimit();
       this._loadData();
     });
 
@@ -444,6 +465,12 @@ class ChartPane {
       : (localStorage.getItem('globalSource') || 'oanda');
     this.source = isHL ? 'hyperliquid' : globalSrc;
 
+    // candleLimit is keyed by symbol+interval — pick up whatever was last
+    // chosen for this symbol on the current interval (or the default).
+    this.candleLimit = this._loadCandleLimit();
+    const limitEl = this.container.querySelector('.pane-limit-select');
+    if (limitEl) limitEl.value = this.candleLimit;
+
     this._loadData();
   }
 
@@ -460,7 +487,7 @@ class ChartPane {
     this.candles = [];
     if (!silentReload) this._showLoading(true);
     try {
-      const url = `/api/candles?symbol=${encodeURIComponent(this.symbol)}&interval=${encodeURIComponent(this.interval)}&source=${this.source}&limit=400`;
+      const url = `/api/candles?symbol=${encodeURIComponent(this.symbol)}&interval=${encodeURIComponent(this.interval)}&source=${this.source}&limit=${this.candleLimit}`;
       console.log(`[Pane ${this.id}] → ${url}${silentReload ? ' (silent reload)' : ''}`);
 
       const res = await fetch(url);
@@ -600,6 +627,23 @@ class ChartPane {
       const v = parseFloat(localStorage.getItem(`barSpacing:${this.symbol}:${this.interval}`));
       return isNaN(v) ? null : v;
     } catch(e) { return null; }
+  }
+
+  // ── Candle count (history depth) ─────────────────────
+  // Persisted per symbol + interval, same granularity as barSpacing — a
+  // backtest-heavy pair/timeframe can carry a much larger limit than the rest.
+
+  _saveCandleLimit() {
+    try {
+      localStorage.setItem(`candleLimit:${this.symbol}:${this.interval}`, this.candleLimit);
+    } catch(e) {}
+  }
+
+  _loadCandleLimit() {
+    try {
+      const v = parseInt(localStorage.getItem(`candleLimit:${this.symbol}:${this.interval}`), 10);
+      return CANDLE_LIMITS.includes(v) ? v : DEFAULT_CANDLE_LIMIT;
+    } catch(e) { return DEFAULT_CANDLE_LIMIT; }
   }
 
   // ── Candle colours ───────────────────────────────────
